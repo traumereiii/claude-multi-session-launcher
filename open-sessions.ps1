@@ -11,6 +11,7 @@
   .\open-sessions.ps1 -Group my-app -Names a,b           # 일부만
   .\open-sessions.ps1 -Group my-app -TitlePrefix APP-    # 세션 이름 APP-A ~ (기본은 MY-APP-A ~)
   .\open-sessions.ps1 -Group my-app -Tabs                # 한 창의 탭으로
+  .\open-sessions.ps1 -Group my-app -Model claude-sonnet-5-5 -Effort high   # 모델·effort 지정(생략하면 claude 기본값)
   .\open-sessions.ps1 -Group my-app -DryRun              # 실행하지 않고 명령만 출력
   .\open-sessions.ps1 -Group my-app -Monitor 1           # 두 번째 모니터에 바둑판 배치
   .\open-sessions.ps1 -Group my-app -Cols 2              # 2열로 배치(6개면 2열 x 3행)
@@ -25,6 +26,10 @@ param(
     [string[]] $Names,
     [switch]   $Tabs,
     [switch]   $Bypass,
+    [ValidatePattern('^[A-Za-z0-9._\[\]-]*$')]
+    [string]   $Model,         # claude --model 에 넘길 값(별칭 sonnet/opus 또는 전체 모델 ID). 생략하면 지정하지 않음
+    [ValidateSet('', 'low', 'medium', 'high', 'xhigh', 'max')]
+    [string]   $Effort,        # claude --effort 에 넘길 값. 생략하면 지정하지 않음
     [switch]   $DryRun,
     [switch]   $NoLayout,      # 창 위치·크기를 건드리지 않는다(기본은 화면에 바둑판으로 배치)
     [int]      $Cols = 0,      # 배치 열 수. 0 이면 개수에 맞춰 자동(6개 → 3열 x 2행)
@@ -44,7 +49,10 @@ $cfg = @{
 if (-not $Names) { $Names = $cfg.Letters }
 $Names = $Names | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
 
-$claudeArgs = if ($Bypass) { ' --dangerously-skip-permissions' } else { '' }
+$claudeArgs = ''
+if ($Model)  { $claudeArgs += " --model $Model" }
+if ($Effort) { $claudeArgs += " --effort $Effort" }
+if ($Bypass) { $claudeArgs += ' --dangerously-skip-permissions' }
 
 # claude 는 세션을 "작업 폴더 경로" 기준 폴더(~\.claude\projects\D--workspace-...)에 저장하고,
 # /rename 한 이름은 그 안의 *.jsonl 에 "customTitle" 로 남긴다. 그걸로 세션이 있는지 본다.

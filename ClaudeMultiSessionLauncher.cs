@@ -74,11 +74,17 @@ namespace ClaudeMultiSessionLauncher
         public int Cols;        // 0 = 자동
         public bool Bypass, NoLayout, Tabs;
 
+        // claude 에 넘길 모델·effort. 빈 문자열이면 지정하지 않는다(claude 기본값/기존 설정 유지).
+        public const string DefaultModel = "claude-sonnet-5-5";
+        public const string DefaultEffort = "high";
+        public string Model = DefaultModel;
+        public string Effort = DefaultEffort;
+
         public string Serialize()
         {
             return string.Join("|", new[] {
                 Project, string.Join(",", Names.ToArray()), Monitor.ToString(), Cols.ToString(),
-                Bypass ? "1" : "0", NoLayout ? "1" : "0", Tabs ? "1" : "0" });
+                Bypass ? "1" : "0", NoLayout ? "1" : "0", Tabs ? "1" : "0", Model ?? "", Effort ?? "" });
         }
 
         public static RunOptions Parse(string s)
@@ -87,6 +93,8 @@ namespace ClaudeMultiSessionLauncher
             int m, c;
             if (p.Length < 7 || p[0].Length == 0 || !int.TryParse(p[2], out m) || !int.TryParse(p[3], out c)) return null;
             var o = new RunOptions { Project = p[0], Monitor = m, Cols = c, Bypass = p[4] == "1", NoLayout = p[5] == "1", Tabs = p[6] == "1" };
+            // 모델·effort 가 없던 예전 설정은 기본값(sonnet 5.5 / high)을 쓴다
+            if (p.Length >= 9) { o.Model = p[7]; o.Effort = p[8]; }
             foreach (string n in p[1].Split(',')) if (n.Length > 0) o.Names.Add(n);
             return o;
         }
@@ -101,6 +109,8 @@ namespace ClaudeMultiSessionLauncher
             parts.Add(NoLayout ? "배치 안 함" : (Cols == 0 ? "자동 배치" : Cols + "열"));
             if (Tabs) parts.Add("탭");
             if (Bypass) parts.Add("Bypass");
+            if (!string.IsNullOrEmpty(Model)) parts.Add(Model);
+            if (!string.IsNullOrEmpty(Effort)) parts.Add("effort " + Effort);
             string names = string.Join(",", Names.Select(n => n.ToUpperInvariant()).ToArray());
             return Project + "   " + names + "   [" + string.Join(" · ", parts.ToArray()) + "]";
         }
@@ -188,6 +198,8 @@ namespace ClaudeMultiSessionLauncher
             sb.Append(" -Root ").Append(Q(root));
             sb.Append(" -Monitor ").Append(o.Monitor);
             sb.Append(" -Cols ").Append(o.Cols);
+            if (!string.IsNullOrEmpty(o.Model)) sb.Append(" -Model ").Append(Q(o.Model));
+            if (!string.IsNullOrEmpty(o.Effort)) sb.Append(" -Effort ").Append(Q(o.Effort));
             if (o.Bypass) sb.Append(" -Bypass");
             if (o.NoLayout) sb.Append(" -NoLayout");
             if (o.Tabs) sb.Append(" -Tabs");
@@ -291,6 +303,55 @@ namespace ClaudeMultiSessionLauncher
         }
     }
 
+    // 이미 클론돼 있는 프로젝트 폴더를 훑은 결과
+    class ExistingScan
+    {
+        public string Name;     // 프로젝트 폴더 이름(예: safed)
+        public string Root;     // 그 폴더의 상위 = 작업 폴더(예: C:\workspace). 드라이브 루트면 null
+        public List<string> Letters = new List<string>();   // 실제로 있는 글자 폴더(a, b, …)
+        public int Count;       // 가장 뒤 글자까지의 개수(a,b,c,f 가 있으면 6)
+    }
+
+    // 이미 클론된 프로젝트를 등록하기 위한 도우미(클론은 하지 않는다)
+    static class Registrar
+    {
+        // {dir}\{이름}-a ~ z 중 있는 폴더를 찾는다. 폴더가 없으면 null.
+        public static ExistingScan Scan(string dir)
+        {
+            string d = (dir ?? "").Trim().TrimEnd('\\', '/');
+            if (d.Length == 0 || !Directory.Exists(d)) return null;
+            var r = new ExistingScan { Name = Path.GetFileName(d) };
+            try { var parent = Directory.GetParent(d); if (parent != null) r.Root = parent.FullName.TrimEnd('\\'); } catch (Exception) { }
+            foreach (string l in ProjectDef.Letters(26))
+                if (Directory.Exists(Path.Combine(d, r.Name + "-" + l))) { r.Letters.Add(l); r.Count = l[0] - 'a' + 1; }
+            return r;
+        }
+
+        // 클론된 폴더의 origin 주소를 읽는다(없거나 git 이 없으면 빈 문자열)
+        public static string ReadRemote(string folder)
+        {
+            var psi = new ProcessStartInfo("git", "-C \"" + folder.TrimEnd('\\') + "\" config --get remote.origin.url")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8
+            };
+            try
+            {
+                using (var p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    if (!p.WaitForExit(5000)) { try { p.Kill(); } catch (Exception) { } return ""; }
+                    return p.ExitCode == 0 ? output.Trim() : "";
+                }
+            }
+            catch (Exception) { return ""; }
+        }
+    }
+
     class MainForm : Form
     {
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
@@ -307,7 +368,8 @@ namespace ClaudeMultiSessionLauncher
         bool busy;   // 열기·미리보기·세션 추가 중에는 다른 작업을 막는다
 
         // 실행 탭
-        ComboBox cmbProject, cmbMonitor, cmbCols;
+        ComboBox cmbProject, cmbMonitor, cmbCols, cmbModel, cmbEffort;
+        const string NoneLabel = "(지정 안 함)";
         FlowLayoutPanel flpSessions;
         CheckBox chkBypass, chkNoLayout, chkTabs, chkClose;
         Button btnPreview, btnRun;
@@ -320,6 +382,14 @@ namespace ClaudeMultiSessionLauncher
         internal NumericUpDown nudCount;
         internal TextBox lblClonePreview;   // 미리보기(읽기 전용, 길면 스크롤)
         Button btnClone;
+
+        // 등록 탭(이미 클론된 프로젝트)
+        internal TextBox txtRegPath, txtRegUrl, txtRegTitle, txtRegLog;
+        internal NumericUpDown nudRegCount;
+        internal TextBox lblRegPreview;
+        Button btnRegister;
+        bool regTitleEdited, regUrlEdited;   // 직접 고친 칸은 폴더를 다시 고를 때 덮어쓰지 않는다
+        bool regAutoFilling;
 
         public MainForm(Settings settings, int startTab)
         {
@@ -354,10 +424,13 @@ namespace ClaudeMultiSessionLauncher
             var run = new TabPage("실행");
             var clone = new TabPage("클론");
             tabs.TabPages.Add(run);
+            var register = new TabPage("등록");
             tabs.TabPages.Add(clone);
+            tabs.TabPages.Add(register);
             Controls.Add(tabs);
             BuildRunTab(run);
             BuildCloneTab(clone);
+            BuildRegisterTab(register);
         }
 
         static Label L(string text, int x, int y, int w) { return new Label { Text = text, Left = x, Top = y + 4, Width = w, AutoSize = false }; }
@@ -391,32 +464,44 @@ namespace ClaudeMultiSessionLauncher
             for (int c = 1; c <= 8; c++) cmbCols.Items.Add(c + "열");
             t.Controls.Add(cmbCols);
 
-            chkBypass = new CheckBox { Text = "권한 확인 건너뛰기 (--dangerously-skip-permissions)", Left = 100, Top = 158, Width = 540 };
-            chkNoLayout = new CheckBox { Text = "창 위치·크기 배치 안 함 (Windows Terminal 기본값)", Left = 100, Top = 184, Width = 540 };
-            chkTabs = new CheckBox { Text = "한 창의 탭으로 열기 (이 경우 배치는 적용되지 않음)", Left = 100, Top = 210, Width = 540 };
-            chkClose = new CheckBox { Text = "열기 후 런처 닫기", Left = 100, Top = 236, Width = 540 };
+            // 모델은 직접 입력도 가능(별칭 sonnet/opus 나 전체 모델 ID). 비우거나 "(지정 안 함)" 이면 --model 을 붙이지 않는다.
+            t.Controls.Add(L("모델", 14, 158, 80));
+            cmbModel = new ComboBox { Left = 100, Top = 158, Width = 260, DropDownStyle = ComboBoxStyle.DropDown };
+            cmbModel.Items.AddRange(new object[] { NoneLabel, "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-haiku-5-5", "sonnet", "opus", "haiku", "fable" });
+            cmbModel.Text = RunOptions.DefaultModel;
+            t.Controls.Add(cmbModel);
+            t.Controls.Add(L("Effort", 380, 158, 50));
+            cmbEffort = new ComboBox { Left = 436, Top = 158, Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbEffort.Items.AddRange(new object[] { NoneLabel, "low", "medium", "high", "xhigh", "max" });
+            cmbEffort.SelectedItem = RunOptions.DefaultEffort;
+            t.Controls.Add(cmbEffort);
+
+            chkBypass = new CheckBox { Text = "권한 확인 건너뛰기 (--dangerously-skip-permissions)", Left = 100, Top = 194, Width = 540 };
+            chkNoLayout = new CheckBox { Text = "창 위치·크기 배치 안 함 (Windows Terminal 기본값)", Left = 100, Top = 220, Width = 540 };
+            chkTabs = new CheckBox { Text = "한 창의 탭으로 열기 (이 경우 배치는 적용되지 않음)", Left = 100, Top = 246, Width = 540 };
+            chkClose = new CheckBox { Text = "열기 후 런처 닫기", Left = 100, Top = 272, Width = 540 };
             t.Controls.AddRange(new Control[] { chkBypass, chkNoLayout, chkTabs, chkClose });
 
-            btnPreview = new Button { Text = "미리보기", Left = 100, Top = 272, Width = 120, Height = 34 };
-            btnRun = new Button { Text = "열기", Left = 230, Top = 272, Width = 150, Height = 34 };
+            btnPreview = new Button { Text = "미리보기", Left = 100, Top = 308, Width = 120, Height = 34 };
+            btnRun = new Button { Text = "열기", Left = 230, Top = 308, Width = 150, Height = 34 };
             btnPreview.Click += delegate { Execute(Collect(), true); };
             btnRun.Click += delegate { Execute(Collect(), false); };
             t.Controls.Add(btnPreview);
             t.Controls.Add(btnRun);
-            lblStatus = new Label { Left = 392, Top = 278, Width = 280, AutoSize = false, ForeColor = Color.DimGray };
+            lblStatus = new Label { Left = 392, Top = 314, Width = 280, AutoSize = false, ForeColor = Color.DimGray };
             t.Controls.Add(lblStatus);
 
-            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 14, Top = 322, Width = 650, AutoSize = false });
-            lstRecent = new ListBox { Left = 14, Top = 346, Width = 656, Height = 104, IntegralHeight = false };
+            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 14, Top = 358, Width = 650, AutoSize = false });
+            lstRecent = new ListBox { Left = 14, Top = 382, Width = 656, Height = 80, IntegralHeight = false };
             Anchored(lstRecent, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
             lstRecent.SelectedIndexChanged += delegate { OnRecentSelected(); };
             lstRecent.DoubleClick += delegate { if (lstRecent.SelectedIndex >= 0) Execute(Collect(), false); };
             t.Controls.Add(lstRecent);
 
-            t.Controls.Add(new Label { Text = "결과", Left = 14, Top = 458, Width = 100, AutoSize = false });
-            lblRoot = new Label { Left = 120, Top = 462, Width = 550, AutoSize = false, ForeColor = Color.DimGray };
+            t.Controls.Add(new Label { Text = "결과", Left = 14, Top = 470, Width = 100, AutoSize = false });
+            lblRoot = new Label { Left = 120, Top = 474, Width = 550, AutoSize = false, ForeColor = Color.DimGray };
             t.Controls.Add(lblRoot);
-            txtLog = new TextBox { Left = 14, Top = 480, Width = 656, Height = 176, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            txtLog = new TextBox { Left = 14, Top = 492, Width = 656, Height = 164, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
             Anchored(txtLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
             t.Controls.Add(txtLog);
         }
@@ -518,6 +603,175 @@ namespace ClaudeMultiSessionLauncher
             };
         }
 
+        // 이미 클론된 프로젝트를 실행 탭에 등록한다. 프로젝트 폴더(예: C:\workspace\safed)를 고르면
+        // 그 아래 {폴더명}-a ~ 를 훑어 갯수·원격 주소·세션 이름 접두사를 채운다. 클론은 하지 않는다.
+        void BuildRegisterTab(TabPage t)
+        {
+            t.Controls.Add(L("프로젝트 폴더", 14, 14, 90));
+            txtRegPath = new TextBox { Left = 110, Top = 14, Width = 460 };
+            Anchored(txtRegPath, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
+            t.Controls.Add(txtRegPath);
+            var btnBrowse = new Button { Text = "찾아보기", Left = 580, Top = 12, Width = 80, Height = 28 };
+            Anchored(btnBrowse, AnchorStyles.Top | AnchorStyles.Right);
+            btnBrowse.Click += delegate
+            {
+                using (var d = new FolderBrowserDialog())
+                {
+                    d.Description = "세션 폴더들(예: safed-a, safed-b …)이 들어 있는 프로젝트 폴더(예: safed)를 고르세요.";
+                    if (Directory.Exists(txtRegPath.Text.Trim())) d.SelectedPath = txtRegPath.Text.Trim();
+                    else if (Directory.Exists(s.Root)) d.SelectedPath = s.Root;
+                    if (d.ShowDialog(this) == DialogResult.OK) txtRegPath.Text = d.SelectedPath;
+                }
+            };
+            t.Controls.Add(btnBrowse);
+
+            t.Controls.Add(L("원격 주소", 14, 50, 90));
+            txtRegUrl = new TextBox { Left = 110, Top = 50, Width = 550 };
+            Anchored(txtRegUrl, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
+            t.Controls.Add(txtRegUrl);
+
+            t.Controls.Add(L("갯수", 14, 86, 90));
+            nudRegCount = new NumericUpDown { Left = 110, Top = 86, Width = 60, Minimum = 1, Maximum = 26, Value = 6 };
+            t.Controls.Add(nudRegCount);
+            t.Controls.Add(L("세션 이름 접두사", 200, 86, 120));
+            txtRegTitle = new TextBox { Left = 326, Top = 86, Width = 334 };
+            Anchored(txtRegTitle, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
+            t.Controls.Add(txtRegTitle);
+
+            t.Controls.Add(new Label
+            {
+                Text = "폴더를 고르면 갯수·원격 주소를 폴더에서 읽어 채웁니다. 갯수는 고쳐도 됩니다. 원격 주소는 세션 추가(+ 추가)에만 필요합니다.",
+                Left = 110, Top = 122, Width = 550, Height = 32, AutoSize = false, ForeColor = Color.DimGray
+            });
+
+            lblRegPreview = new TextBox
+            {
+                Left = 110, Top = 158, Width = 550, Height = 204, Multiline = true, ReadOnly = true, WordWrap = false,
+                ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None, TabStop = false,
+                BackColor = SystemColors.Control, ForeColor = Color.DimGray
+            };
+            Anchored(lblRegPreview, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
+            t.Controls.Add(lblRegPreview);
+            btnRegister = new Button { Text = "등록", Left = 110, Top = 368, Width = 140, Height = 34 };
+            btnRegister.Click += delegate { StartRegister(); };
+            t.Controls.Add(btnRegister);
+
+            txtRegLog = new TextBox { Left = 14, Top = 414, Width = 656, Height = 240, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            Anchored(txtRegLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
+            t.Controls.Add(txtRegLog);
+
+            // 폴더 → 갯수·원격 주소·세션 이름 접두사. 직접 고친 칸은 건드리지 않고, 비우면 다시 자동으로 채운다.
+            txtRegPath.TextChanged += delegate { OnRegPathChanged(); };
+            txtRegTitle.TextChanged += delegate
+            {
+                if (!regAutoFilling) regTitleEdited = txtRegTitle.Text.Trim().Length > 0;
+                UpdateRegPreview();
+            };
+            txtRegUrl.TextChanged += delegate { if (!regAutoFilling) regUrlEdited = txtRegUrl.Text.Trim().Length > 0; };
+            nudRegCount.ValueChanged += delegate { UpdateRegPreview(); };
+            nudRegCount.TextChanged += delegate { UpdateRegPreview(); };
+            UpdateRegPreview();
+        }
+
+        void OnRegPathChanged()
+        {
+            var scan = Registrar.Scan(txtRegPath.Text);
+            regAutoFilling = true;
+            try
+            {
+                if (scan != null && scan.Count > 0)
+                {
+                    nudRegCount.Value = scan.Count;
+                    if (!regTitleEdited) txtRegTitle.Text = ProjectDef.DefaultTitle(scan.Name);
+                    if (!regUrlEdited)
+                        txtRegUrl.Text = Registrar.ReadRemote(Path.Combine(txtRegPath.Text.Trim().TrimEnd('\\'), scan.Name + "-" + scan.Letters[0]));
+                }
+                else
+                {
+                    if (!regTitleEdited) txtRegTitle.Text = "";
+                    if (!regUrlEdited) txtRegUrl.Text = "";
+                }
+            }
+            finally { regAutoFilling = false; }
+            UpdateRegPreview();
+        }
+
+        void UpdateRegPreview()
+        {
+            string path = txtRegPath.Text.Trim().TrimEnd('\\');
+            if (path.Length == 0) { lblRegPreview.Text = "이미 클론된 프로젝트 폴더(세션 폴더 {폴더명}-a, -b … 가 들어 있는 폴더)를 고르세요.\r\n예) C:\\workspace\\safed  (안에 safed-a, safed-b … 가 있는 경우)"; return; }
+            var scan = Registrar.Scan(path);
+            if (scan == null) { lblRegPreview.Text = "폴더를 찾을 수 없습니다: " + path; return; }
+            if (scan.Count == 0) { lblRegPreview.Text = "'" + path + "' 아래에 " + scan.Name + "-a, " + scan.Name + "-b … 폴더가 없습니다.\r\n세션 폴더가 들어 있는 상위 폴더(프로젝트 폴더)를 고르세요."; return; }
+            string title = txtRegTitle.Text.Trim();
+            if (title.Length == 0) title = ProjectDef.DefaultTitle(scan.Name);
+            int n = (int)nudRegCount.Value;
+            // 한 줄 = "[세션명] 폴더명". 폴더가 실제로 없는 글자는 표시한다(열 때 건너뛴다).
+            var rows = ProjectDef.Letters(n).Select(l => "[" + ProjectDef.SessionName(title, l) + "] " + scan.Name + "-" + l
+                + (scan.Letters.Contains(l) ? "" : "   ← 폴더 없음(열 때 건너뜀)")).ToArray();
+            int outside = scan.Letters.Count(l => l[0] - 'a' + 1 > n);   // 갯수보다 뒤 글자의 폴더
+            string extra = outside > 0 ? "\r\n※ 폴더 " + outside + "개(" + scan.Name + "-" + ProjectDef.Letters(26)[n] + " ~)는 갯수 밖이라 등록되지 않습니다." : "";
+            lblRegPreview.Text = "프로젝트 폴더:  " + path + "   (" + n + "개)\r\n" + string.Join("\r\n", rows) + extra;
+        }
+
+        void RegLog(string line)
+        {
+            try { BeginInvoke(new Action(delegate { txtRegLog.AppendText(line + "\r\n"); })); } catch (Exception) { }
+        }
+
+        void StartRegister()
+        {
+            string path = txtRegPath.Text.Trim().TrimEnd('\\');
+            var scan = Registrar.Scan(path);
+            if (scan == null) { MessageBox.Show(this, "프로젝트 폴더를 찾을 수 없습니다. 폴더를 고르세요.", Text); return; }
+            if (!Regex.IsMatch(scan.Name, @"^[A-Za-z0-9._-]+$")) { MessageBox.Show(this, "폴더명은 영문·숫자·. _ - 만 쓸 수 있습니다: " + scan.Name, Text); return; }
+            if (scan.Root == null) { MessageBox.Show(this, "드라이브 루트는 프로젝트 폴더로 쓸 수 없습니다. 하위 폴더를 고르세요.", Text); return; }
+            if (scan.Count == 0) { MessageBox.Show(this, "'" + path + "' 아래에 " + scan.Name + "-a 같은 세션 폴더가 없습니다.\n세션 폴더가 들어 있는 상위 폴더를 고르세요.", Text); return; }
+
+            int count = (int)nudRegCount.Value;
+            string title = txtRegTitle.Text.Trim();
+            if (title.Length == 0) title = ProjectDef.DefaultTitle(scan.Name);
+            string url = txtRegUrl.Text.Trim();
+            bool rootChanged = !string.Equals(scan.Root, s.Root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+
+            string first = ProjectDef.SessionName(title, "a"), last = ProjectDef.SessionName(title, ((char)('a' + count - 1)).ToString());
+            string msg = "'" + scan.Name + "' 을(를) 실행 탭에 등록합니다.\n\n세션: " + first + " ~ " + last + " (" + count + "개)\n폴더: " + path + "\\" + scan.Name + "-a ~\n"
+                + (url.Length > 0 ? "원격: " + url : "원격 주소 없음 (세션 추가 불가)");
+            if (rootChanged) msg += "\n\n작업 폴더가 바뀝니다:\n" + s.Root + "\n→ " + scan.Root + "\n(다른 프로젝트도 이 위치에서 찾습니다)";
+            msg += "\n\n계속할까요?";
+            if (MessageBox.Show(this, msg, Text, MessageBoxButtons.YesNo, rootChanged ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            txtRegLog.Text = "";
+            RegisterExisting(scan.Root, new ProjectDef { Name = scan.Name, Title = title, Count = count, Remote = url });
+        }
+
+        // 프로젝트를 설정에 등록하고 실행 탭에 반영한다(폴더는 건드리지 않는다)
+        internal void RegisterExisting(string root, ProjectDef def)
+        {
+            bool existed = s.Find(def.Name) != null;
+            if (!string.Equals(root, s.Root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            {
+                s.Root = root;
+                txtRoot.Text = root;
+            }
+            s.UpsertProject(def);
+            try { s.Save(); } catch (Exception ex) { RegLog("설정 저장 실패: " + ex.Message); }
+            RefreshAfterRegister(def.Name, true);
+            RegLog("끝: 프로젝트 '" + def.Name + "' " + (existed ? "정보를 갱신했습니다" : "이(가) 실행 탭에 등록되었습니다") + " (" + def.Count + "개).");
+        }
+
+        // 프로젝트 목록을 다시 채우고, 방금 등록한 프로젝트(또는 선택된 것이 없으면 그것)의 세션 목록을 새로 그린다
+        void RefreshAfterRegister(string name, bool select)
+        {
+            bool was = loading;
+            loading = true;
+            string keep = cmbProject.SelectedItem as string;
+            RefreshProjects();
+            if (select) cmbProject.SelectedItem = name;
+            loading = was;
+            if (select || keep == null || keep == name) OnProjectChanged();
+        }
+
         static List<Screen> ScreensInOrder()
         {
             return Screen.AllScreens.OrderBy(x => x.Primary ? 0 : 1).ThenBy(x => x.Bounds.X).ToList();
@@ -538,7 +792,7 @@ namespace ClaudeMultiSessionLauncher
                 o.Names.AddRange(ProjectDef.Letters(s.Projects[0].Count));
             }
             if (o != null) ApplyOptions(o);
-            else Status("등록된 프로젝트가 없습니다. 클론 탭에서 먼저 클론하세요.");
+            else Status("등록된 프로젝트가 없습니다. 클론 탭에서 클론하거나, 등록 탭에서 이미 클론된 폴더를 등록하세요.");
             loading = false;
             UpdateRootLabel();
             UpdateClonePreview();
@@ -608,6 +862,9 @@ namespace ClaudeMultiSessionLauncher
             RebuildSessions(p, o.Names);
             cmbMonitor.SelectedIndex = o.Monitor >= 0 && o.Monitor < cmbMonitor.Items.Count ? o.Monitor : 0;
             cmbCols.SelectedIndex = o.Cols >= 0 && o.Cols < cmbCols.Items.Count ? o.Cols : 0;
+            cmbModel.Text = string.IsNullOrEmpty(o.Model) ? NoneLabel : o.Model;
+            int ei = string.IsNullOrEmpty(o.Effort) ? 0 : cmbEffort.Items.IndexOf(o.Effort);
+            cmbEffort.SelectedIndex = ei >= 0 ? ei : 0;
             chkBypass.Checked = o.Bypass;
             chkNoLayout.Checked = o.NoLayout;
             chkTabs.Checked = o.Tabs;
@@ -621,6 +878,8 @@ namespace ClaudeMultiSessionLauncher
                 Project = cmbProject.SelectedItem as string ?? "",
                 Monitor = Math.Max(0, cmbMonitor.SelectedIndex),
                 Cols = Math.Max(0, cmbCols.SelectedIndex),
+                Model = cmbModel.Text.Trim() == NoneLabel ? "" : Regex.Replace(cmbModel.Text, @"[^A-Za-z0-9._\[\]-]", ""),
+                Effort = cmbEffort.SelectedIndex <= 0 ? "" : (string)cmbEffort.SelectedItem,
                 Bypass = chkBypass.Checked,
                 NoLayout = chkNoLayout.Checked,
                 Tabs = chkTabs.Checked
@@ -859,12 +1118,7 @@ namespace ClaudeMultiSessionLauncher
             {
                 s.UpsertProject(new ProjectDef { Name = name, Title = title, Count = count, Remote = url });
                 try { s.Save(); } catch (Exception) { }
-                bool was = loading;
-                loading = true;
-                string keep = cmbProject.SelectedItem as string;
-                RefreshProjects();
-                loading = was;
-                if (keep == null || keep == name) OnProjectChanged();
+                RefreshAfterRegister(name, false);
                 CloneLog("끝: " + ok + "/" + count + "개 사용 가능. 프로젝트 '" + name + "' 이(가) 실행 탭에 등록되었습니다.");
             }
             else CloneLog("끝: 클론된 폴더가 없습니다.");
@@ -887,7 +1141,7 @@ namespace ClaudeMultiSessionLauncher
                 if (args[i] == "--home" && i + 1 < args.Length) home = args[++i];
                 else if (args[i] == "--selftest" && i + 1 < args.Length) selftest = args[++i];
                 else if (args[i] == "--clone-src" && i + 1 < args.Length) cloneSrc = args[++i];
-                else if (args[i] == "--tab" && i + 1 < args.Length) startTab = args[++i] == "clone" ? 1 : 0;
+                else if (args[i] == "--tab" && i + 1 < args.Length) { string tab = args[++i]; startTab = tab == "clone" ? 1 : tab == "register" ? 2 : 0; }
             }
             if (selftest != null) return SelfTest.Run(selftest, home, cloneSrc);
 
@@ -938,6 +1192,12 @@ namespace ClaudeMultiSessionLauncher
                 var o2 = RunOptions.Parse(o.Serialize());
                 Check("RunOptions 직렬화 왕복", o2 != null && o2.Serialize() == o.Serialize(), o.Serialize());
                 Check("RunOptions.Describe", o.Describe().Contains("A,C") && o.Describe().Contains("모니터 2"), o.Describe());
+                Check("모델·effort 기본값은 sonnet 5.5 / high", new RunOptions().Model == "claude-sonnet-5-5" && new RunOptions().Effort == "high", "");
+                var oldFmt = RunOptions.Parse("demo|a,c|1|2|1|0|0");   // 모델·effort 가 없던 예전 형식
+                Check("예전 설정은 기본 모델·effort 로 읽음", oldFmt != null && oldFmt.Model == "claude-sonnet-5-5" && oldFmt.Effort == "high", oldFmt == null ? "null" : oldFmt.Serialize());
+                var none = new RunOptions { Project = "demo", Model = "", Effort = "" }; none.Names.Add("a");
+                var none2 = RunOptions.Parse(none.Serialize());
+                Check("모델·effort 지정 안 함도 왕복", none2 != null && none2.Model == "" && none2.Effort == "", none.Serialize());
 
                 if (Directory.Exists(home)) Directory.Delete(home, true);
                 var s = Settings.Load(home, "D:\\workspace");
@@ -983,14 +1243,39 @@ namespace ClaudeMultiSessionLauncher
                     Check("칸을 비우면 다시 자동으로 채움", form.txtName.Text == "again" && form.txtTitle.Text == "AGAIN-", form.txtName.Text + " / " + form.txtTitle.Text);
                     form.nudCount.Value = 6;
                     Check("6개면 6줄 전부 표시", form.lblClonePreview.Text.EndsWith("(6개)\r\n[AGAIN-A] again-a\r\n[AGAIN-B] again-b\r\n[AGAIN-C] again-c\r\n[AGAIN-D] again-d\r\n[AGAIN-E] again-e\r\n[AGAIN-F] again-f"),form.lblClonePreview.Text.Replace("\r\n", " | "));
+
+                    // 이미 클론된 프로젝트 등록: 가짜 폴더 trial\{ex-a,ex-b,ex-c,ex-f} + 관련 없는 폴더
+                    string exRoot = Path.Combine(home, "existing-root"), exDir = Path.Combine(exRoot, "ex");
+                    foreach (string sub in new[] { "ex-a", "ex-b", "ex-c", "ex-f", "ex-f-extra", "other" }) Directory.CreateDirectory(Path.Combine(exDir, sub));
+                    var scan = Registrar.Scan(exDir + "\\");
+                    Check("등록 스캔: 이름·상위·글자", scan != null && scan.Name == "ex" && scan.Root == exRoot && string.Join("", scan.Letters.ToArray()) == "abcf", scan == null ? "null" : scan.Name + " / " + scan.Root + " / " + string.Join("", scan.Letters.ToArray()));
+                    Check("등록 스캔: 갯수는 가장 뒤 글자(f=6), ex-f-extra 는 무시", scan != null && scan.Count == 6, scan == null ? "null" : scan.Count.ToString());
+                    Check("등록 스캔: 없는 폴더는 null", Registrar.Scan(Path.Combine(exRoot, "nope")) == null, "");
+                    Check("등록 스캔: 세션 폴더가 없으면 갯수 0", Registrar.Scan(Path.Combine(exDir, "other")).Count == 0, "");
+                    Check("git 저장소가 아니면 원격 주소는 빈 문자열", Registrar.ReadRemote(Path.Combine(exDir, "ex-a")) == "", "");
+
+                    form.txtRegPath.Text = exDir;
+                    Check("등록 탭: 폴더를 고르면 갯수·접두사 자동", form.nudRegCount.Value == 6 && form.txtRegTitle.Text == "EX-", form.nudRegCount.Value + " / " + form.txtRegTitle.Text);
+                    Check("등록 미리보기: 없는 폴더 표시", form.lblRegPreview.Text.Contains("[EX-A] ex-a\r\n") && form.lblRegPreview.Text.Contains("[EX-D] ex-d   ← 폴더 없음") && form.lblRegPreview.Text.Contains("[EX-F] ex-f"), form.lblRegPreview.Text.Replace("\r\n", " | "));
+                    form.nudRegCount.Value = 4;
+                    Check("갯수를 줄이면 갯수 밖 폴더 안내", form.lblRegPreview.Text.Contains("갯수 밖") && !form.lblRegPreview.Text.Contains("[EX-F]"), form.lblRegPreview.Text.Replace("\r\n", " | "));
+                    form.RegisterExisting(exRoot, new ProjectDef { Name = "ex", Title = form.txtRegTitle.Text, Count = (int)form.nudRegCount.Value, Remote = "" });
+                    Check("등록 후 설정에 반영(개수 4)", s3.Find("ex") != null && s3.Find("ex").Count == 4 && s3.Root == exRoot, s3.Find("ex") == null ? "없음" : s3.Find("ex").Serialize());
+                    Check("등록 후 실행 탭이 그 프로젝트를 보여 줌", form.Collect().Project == "ex" && form.Collect().Names.Count == 4, form.Collect().Serialize());
+                    form.RegisterExisting(exRoot, new ProjectDef { Name = "ex", Title = "NEW-", Count = 6, Remote = "r" });
+                    Check("같은 프로젝트를 다시 등록하면 갱신(중복 없음)", s3.Projects.Count(p0 => p0.Name == "ex") == 1 && s3.Find("ex").Title == "NEW-" && s3.Find("ex").Count == 6, "");
                 }
-                Check("세션 추가가 설정 파일에 저장됨", Settings.Load(home, "D:\\workspace").Find("demo").Count == 7, "");
+                Check("등록이 설정 파일에 저장됨", Settings.Load(home, "D:\\workspace").Find("ex") != null && Settings.Load(home, "D:\\workspace").Find("ex").Count == 6, "");
+                Check("세션 추가가 설정 파일에 저장됨",Settings.Load(home, "D:\\workspace").Find("demo").Count == 7, "");
 
                 var p = s2.Find("demo");
                 string args =Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, o, true);
                 Check("스크립트 인자", args.Contains("-Group \"demo\"") && args.Contains("-Prefix \"demo-\"") && args.Contains("-TitlePrefix \"DEMO-\"")
                     && args.Contains("-Names a,c") && args.Contains("-Root \"D:\\workspace\"") && args.Contains("-Monitor 1") && args.Contains("-Cols 2")
-                    && args.Contains("-Bypass") && args.Contains("-DryRun") && !args.Contains("-NoLayout"), args);
+                    && args.Contains("-Bypass") && args.Contains("-DryRun") && !args.Contains("-NoLayout")
+                    && args.Contains("-Model \"claude-sonnet-5-5\"") && args.Contains("-Effort \"high\""), args);
+                string argsNone = Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, none, true);
+                Check("지정 안 함이면 -Model/-Effort 를 넘기지 않음", !argsNone.Contains("-Model") && !argsNone.Contains("-Effort"), argsNone);
 
                 if (cloneSrc != null)
                 {
@@ -1008,6 +1293,10 @@ namespace ClaudeMultiSessionLauncher
                     bool de = string.Join("", added.ToArray()) == "de";
                     for (char c = 'd'; c <= 'e'; c++) de &= Directory.Exists(Path.Combine(root, "demo", "demo-" + c, ".git"));
                     Check("세션 추가: d·e 만 클론", de, string.Join(",", added.ToArray()));
+                    string remote = Registrar.ReadRemote(Path.Combine(root, "demo", "demo-a"));
+                    Check("클론된 폴더의 원격 주소 읽기", remote.Length > 0 && Path.GetFileName(remote.TrimEnd('/', '\\')) == Path.GetFileName(cloneSrc.TrimEnd('\\')), remote);
+                    var rs = Registrar.Scan(Path.Combine(root, "demo"));
+                    Check("클론 결과를 등록 스캔이 5개(a~e)로 인식", rs != null && rs.Count == 5 && rs.Root == root, rs == null ? "null" : rs.Count.ToString());
                     int ok3 = Cloner.CloneAll(root, "demo2", Path.Combine(home, "no-such-repo"), 1, add);
                     Check("잘못된 주소는 실패로 집계", ok3 == 0 && log.Any(l => l.Contains("실패")), "성공 " + ok3);
                 }
