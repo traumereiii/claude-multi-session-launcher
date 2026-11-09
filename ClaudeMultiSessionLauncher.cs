@@ -618,8 +618,8 @@ namespace ClaudeMultiSessionLauncher
             ForeColor = Ui.Text;
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(720, 780);
-            MinimumSize = new Size(736, 750);
+            ClientSize = new Size(720, 812);
+            MinimumSize = new Size(736, 782);
             StartPosition = FormStartPosition.CenterScreen;
             BuildUi();
             LoadState();
@@ -694,14 +694,14 @@ namespace ClaudeMultiSessionLauncher
         void BuildRunTab(Control t)
         {
             // ── 세션 ──
-            var c1 = AddCard(t, "세션", 12, 142);
+            var c1 = AddCard(t, "세션", 12, 174);
             c1.Controls.Add(L("프로젝트", 16, 34, 80));
             cmbProject = new ComboBox { Left = 100, Top = 34, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
             cmbProject.SelectedIndexChanged += delegate { if (!loading) OnProjectChanged(); };
             c1.Controls.Add(cmbProject);
 
             c1.Controls.Add(L("세션", 16, 72, 80));
-            flpSessions = new FlowLayoutPanel { Left = 100, Top = 70, Width = 470, Height = 58, WrapContents = true, AutoScroll = true };
+            flpSessions = new FlowLayoutPanel { Left = 100, Top = 70, Width = 470, Height = 90, WrapContents = true, AutoScroll = true };
             c1.Controls.Add(flpSessions);
             var btnAll = new Button { Text = "전체 선택", Left = 584, Top = 70, Width = 88, Height = 28 };
             var btnNone = new Button { Text = "전체 해제", Left = 584, Top = 102, Width = 88, Height = 28 };
@@ -713,7 +713,7 @@ namespace ClaudeMultiSessionLauncher
             c1.Controls.Add(btnNone);
 
             // ── 창 배치 ──
-            var c2 = AddCard(t, "창 배치", 162, 112);
+            var c2 = AddCard(t, "창 배치", 194, 112);
             c2.Controls.Add(L("모니터", 16, 34, 80));
             cmbMonitor = new ComboBox { Left = 100, Top = 34, Width = 250, DropDownStyle = ComboBoxStyle.DropDownList };
             var screens = ScreensInOrder();
@@ -743,7 +743,7 @@ namespace ClaudeMultiSessionLauncher
 
             // ── Claude 옵션 ──
             // 모델은 직접 입력도 가능(별칭 sonnet/opus 나 전체 모델 ID). 비우거나 "(지정 안 함)" 이면 --model 을 붙이지 않는다.
-            var c3 = AddCard(t, "Claude 옵션", 282, 134);
+            var c3 = AddCard(t, "Claude 옵션", 314, 134);
             c3.Controls.Add(L("모델", 16, 34, 80));
             cmbModel = new ComboBox { Left = 100, Top = 34, Width = 250, DropDownStyle = ComboBoxStyle.DropDown };
             cmbModel.Items.AddRange(new object[] { NoneLabel, "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-haiku-5-5", "sonnet", "opus", "haiku", "fable" });
@@ -764,28 +764,28 @@ namespace ClaudeMultiSessionLauncher
             c3.Controls.AddRange(new Control[] { chkBypass, chkNoLayout, chkTabs, chkClose });
 
             // ── 실행 ──
-            btnPreview = new Button { Text = "미리보기", Left = 16, Top = 424, Width = 120, Height = 38 };
-            btnRun = new Button { Text = "열기", Left = 146, Top = 424, Width = 160, Height = 38 };
+            btnPreview = new Button { Text = "미리보기", Left = 16, Top = 456, Width = 120, Height = 38 };
+            btnRun = new Button { Text = "열기", Left = 146, Top = 456, Width = 160, Height = 38 };
             Ui.StyleButton(btnPreview, false);
             Ui.StyleButton(btnRun, true);
             btnPreview.Click += delegate { Execute(Collect(), true); };
             btnRun.Click += delegate { Execute(Collect(), false); };
             t.Controls.Add(btnPreview);
             t.Controls.Add(btnRun);
-            lblStatus = new Label { Left = 320, Top = 435, Width = 384, AutoSize = false, ForeColor = Ui.Muted };
+            lblStatus = new Label { Left = 320, Top = 467, Width = 384, AutoSize = false, ForeColor = Ui.Muted };
             t.Controls.Add(lblStatus);
 
-            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 16, Top = 472, Width = 688, AutoSize = false, ForeColor = Ui.Muted });
-            lstRecent = new ListBox { Left = 16, Top = 494, Width = 688, Height = 66, IntegralHeight = false, BorderStyle = BorderStyle.FixedSingle };
+            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 16, Top = 504, Width = 688, AutoSize = false, ForeColor = Ui.Muted });
+            lstRecent = new ListBox { Left = 16, Top = 526, Width = 688, Height = 66, IntegralHeight = false, BorderStyle = BorderStyle.FixedSingle };
             Anchored(lstRecent, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
             lstRecent.SelectedIndexChanged += delegate { OnRecentSelected(); };
             lstRecent.DoubleClick += delegate { if (lstRecent.SelectedIndex >= 0) Execute(Collect(), false); };
             t.Controls.Add(lstRecent);
 
-            t.Controls.Add(new Label { Text = "결과", Left = 16, Top = 570, Width = 44, AutoSize = false, Font = Ui.BoldFont });
-            lblRoot = new Label { Left = 64, Top = 570, Width = 640, AutoSize = false, ForeColor = Ui.Muted };
+            t.Controls.Add(new Label { Text = "결과", Left = 16, Top = 602, Width = 44, AutoSize = false, Font = Ui.BoldFont });
+            lblRoot = new Label { Left = 64, Top = 602, Width = 640, AutoSize = false, ForeColor = Ui.Muted };
             t.Controls.Add(lblRoot);
-            txtLog = new TextBox { Left = 16, Top = 592, Width = 688, Height = 130, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            txtLog = new TextBox { Left = 16, Top = 624, Width = 688, Height = 130, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
             Ui.StyleLog(txtLog);
             Anchored(txtLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
             t.Controls.Add(txtLog);
