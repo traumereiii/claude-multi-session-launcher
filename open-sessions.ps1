@@ -15,6 +15,7 @@
   .\open-sessions.ps1 -Group my-app -DryRun              # 실행하지 않고 명령만 출력
   .\open-sessions.ps1 -Group my-app -Monitor 1           # 두 번째 모니터에 바둑판 배치
   .\open-sessions.ps1 -Group my-app -Cols 2              # 2열로 배치(6개면 2열 x 3행)
+  .\open-sessions.ps1 -Group my-app -Names a,b -Rows 2 -Cols 3 -Cells a:1:2,b:2:3   # A 는 1행 2열, B 는 2행 3열 칸에 배치
   .\open-sessions.ps1 -Group my-app -NoLayout            # 창 위치·크기는 Windows Terminal 기본값 그대로
 #>
 param(
@@ -33,6 +34,8 @@ param(
     [switch]   $DryRun,
     [switch]   $NoLayout,      # 창 위치·크기를 건드리지 않는다(기본은 화면에 바둑판으로 배치)
     [int]      $Cols = 0,      # 배치 열 수. 0 이면 개수에 맞춰 자동(6개 → 3열 x 2행)
+    [int]      $Rows = 0,      # 배치 행 수. 0 이면 열 수에 맞춰 자동
+    [string[]] $Cells,         # 세션별 칸 지정: 글자:행:열 (1부터). 예: a:1:2,b:2:3. 지정하지 않은 세션은 빈 칸을 순서대로 채운다
     [int]      $Monitor = 0,   # 배치할 모니터. 0 = 주 모니터, 1 = 다음 모니터
     [string]   $Root = (Split-Path $PSScriptRoot -Parent)   # 프로젝트 폴더들이 있는 곳. 기본은 이 도구 폴더의 상위
 )
@@ -48,6 +51,15 @@ $cfg = @{
 # powershell -File 로 부르면 -Names a,c 가 "a,c" 한 덩어리로 오므로 쉼표로 다시 나눈다
 if (-not $Names) { $Names = $cfg.Letters }
 $Names = $Names | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
+
+# 칸 지정을 글자 → @{Row; Col} 로 바꾼다(powershell -File 로 부르면 쉼표 묶음이 한 덩어리로 와서 다시 나눈다)
+$cellMap = @{}
+foreach ($c in @($Cells | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+    if ($c -match '^([A-Za-z]):(\d{1,2}):(\d{1,2})$' -and [int]$Matches[2] -ge 1 -and [int]$Matches[3] -ge 1) {
+        $cellMap[$Matches[1].ToLower()] = @{ Row = [int]$Matches[2]; Col = [int]$Matches[3] }
+    }
+    else { Write-Warning "칸 지정을 이해하지 못해 무시합니다: $c (형식 글자:행:열, 예 a:1:2)" }
+}
 
 $claudeArgs = ''
 if ($Model)  { $claudeArgs += " --model $Model" }
@@ -75,6 +87,7 @@ $targets = foreach ($n in $Names) {
     $title  = "$($cfg.Title)$(if ($lowerTitle) { $name } else { $name.ToUpper() })"
     $resume = Test-SessionExists $dir $title
     [pscustomobject]@{
+        Letter = $name
         Dir   = $dir
         Title = $title
         Mode  = if ($resume) { '이어서' } else { '새로' }
@@ -100,7 +113,10 @@ if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
         $layout = -not $NoLayout
         if ($layout) {
             . "$PSScriptRoot\window-layout.ps1"
-            $rects  = @(Get-GridRects -Count @($targets).Count -Cols $Cols -Monitor $Monitor)
+            # 창 번호(0부터) → 지정한 칸. 폴더가 없어 건너뛴 세션은 targets 에 없으므로 자연히 빠진다.
+            $cellsByIndex = @{}; $j = 0
+            foreach ($x in $targets) { if ($cellMap.ContainsKey($x.Letter)) { $cellsByIndex[$j] = $cellMap[$x.Letter] }; $j++ }
+            $rects  = @(Get-GridRects -Count @($targets).Count -Cols $Cols -Rows $Rows -Monitor $Monitor -Cells $cellsByIndex)
             $before = @(Get-TerminalWindows)    # 이미 열려 있던 창은 건드리지 않으려고 기억해 둔다
         }
 
@@ -114,7 +130,7 @@ if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
         if ($layout) {
             if ($DryRun) {
                 $i = 0
-                foreach ($x in $targets) { $r = $rects[$i++]; "[배치] $($x.Title)  X=$($r.X) Y=$($r.Y)  $($r.W)x$($r.H)" }
+                foreach ($x in $targets) { $r = $rects[$i++]; "[배치] $($x.Title)  $($r.Row)행 $($r.Col)열  X=$($r.X) Y=$($r.Y)  $($r.W)x$($r.H)" }
             }
             else {
                 # 창이 뜨면 제목으로 찾아 칸에 맞춘다. 뜬 직후엔 wt 가 크기를 다시 잡을 수 있어 잠깐 기다린 뒤 두 번 맞춘다.

@@ -15,6 +15,51 @@ using System.Windows.Forms;
 
 namespace ClaudeMultiSessionLauncher
 {
+    // 화면 격자의 칸 하나(행·열은 1부터)
+    class GridCell
+    {
+        public int Row, Col;
+        public GridCell(int row, int col) { Row = row; Col = col; }
+    }
+
+    // 창 배치 격자 계산. window-layout.ps1 의 Get-GridRects 와 같은 규칙이다.
+    static class GridLayout
+    {
+        public const int MaxSize = 8;   // 화면에서 고를 수 있는 최대 행·열 수
+
+        // 열 수 자동: 1→1, 2→2, 3→3, 4→2, 5·6→3, 7·8→4, 그 외 ⌈√n⌉
+        public static int AutoCols(int count)
+        {
+            switch (count)
+            {
+                case 1: return 1;
+                case 2: return 2;
+                case 3: return 3;
+                case 4: return 2;
+                case 5: case 6: return 3;
+                case 7: case 8: return 4;
+                default: return (int)Math.Ceiling(Math.Sqrt(Math.Max(1, count)));
+            }
+        }
+
+        // 창 count 개와 지정한 칸들로 실제 행·열 수를 정한다(cols·rows 가 0 이면 자동).
+        // 지정한 칸이 격자 밖이거나 칸이 모자라면 격자를 키운다.
+        public static void Resolve(int count, int cols, int rows, IEnumerable<GridCell> fixedCells, out int outRows, out int outCols)
+        {
+            count = Math.Max(1, count);
+            int maxR = 0, maxC = 0, nFixed = 0;
+            foreach (var c in fixedCells) { maxR = Math.Max(maxR, c.Row); maxC = Math.Max(maxC, c.Col); nFixed++; }
+            if (cols <= 0) cols = rows > 0 ? (int)Math.Ceiling(count / (double)rows) : AutoCols(count);
+            if (nFixed == 0 && rows <= 0) cols = Math.Min(cols, count);
+            cols = Math.Max(cols, maxC);
+            if (rows <= 0) rows = (int)Math.Ceiling(count / (double)cols);
+            rows = Math.Max(rows, maxR);
+            while (rows * cols < count) rows++;
+            outRows = rows;
+            outCols = cols;
+        }
+    }
+
     // 프로젝트 하나: 폴더 {Root}\{Name}\{Name}-a ~ , 세션 이름 {Title}A ~
     class ProjectDef
     {
@@ -72,6 +117,9 @@ namespace ClaudeMultiSessionLauncher
         public List<string> Names = new List<string>();
         public int Monitor;     // 0 = 주 모니터
         public int Cols;        // 0 = 자동
+        public int Rows;        // 0 = 자동
+        // 세션 글자(a, b …) → 배치할 칸. 여기 없는 세션은 빈 칸을 순서대로 채운다.
+        public Dictionary<string, GridCell> Cells = new Dictionary<string, GridCell>();
         public bool Bypass, NoLayout, Tabs;
 
         // claude 에 넘길 모델·effort. 빈 문자열이면 지정하지 않는다(claude 기본값/기존 설정 유지).
@@ -84,7 +132,30 @@ namespace ClaudeMultiSessionLauncher
         {
             return string.Join("|", new[] {
                 Project, string.Join(",", Names.ToArray()), Monitor.ToString(), Cols.ToString(),
-                Bypass ? "1" : "0", NoLayout ? "1" : "0", Tabs ? "1" : "0", Model ?? "", Effort ?? "" });
+                Bypass ? "1" : "0", NoLayout ? "1" : "0", Tabs ? "1" : "0", Model ?? "", Effort ?? "",
+                Rows.ToString(), CellsText() });
+        }
+
+        // "a:1:2,b:2:3" (글자:행:열). open-sessions.ps1 의 -Cells 와 같은 형식이다.
+        public string CellsText() { return CellsText(Cells); }
+
+        public static string CellsText(IDictionary<string, GridCell> cells)
+        {
+            return string.Join(",", cells.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => kv.Key + ":" + kv.Value.Row + ":" + kv.Value.Col).ToArray());
+        }
+
+        public static Dictionary<string, GridCell> ParseCells(string s)
+        {
+            var map = new Dictionary<string, GridCell>();
+            foreach (string item in (s ?? "").Split(','))
+            {
+                var m = Regex.Match(item, @"^([a-z]):(\d{1,2}):(\d{1,2})$");
+                if (!m.Success) continue;
+                int r = int.Parse(m.Groups[2].Value), c = int.Parse(m.Groups[3].Value);
+                if (r >= 1 && c >= 1) map[m.Groups[1].Value] = new GridCell(r, c);
+            }
+            return map;
         }
 
         public static RunOptions Parse(string s)
@@ -95,6 +166,8 @@ namespace ClaudeMultiSessionLauncher
             var o = new RunOptions { Project = p[0], Monitor = m, Cols = c, Bypass = p[4] == "1", NoLayout = p[5] == "1", Tabs = p[6] == "1" };
             // 모델·effort 가 없던 예전 설정은 기본값(sonnet 5.5 / high)을 쓴다
             if (p.Length >= 9) { o.Model = p[7]; o.Effort = p[8]; }
+            // 행 수·칸 지정이 없던 예전 설정은 자동 배치
+            if (p.Length >= 11) { int rows; if (int.TryParse(p[9], out rows)) o.Rows = Math.Max(0, rows); o.Cells = ParseCells(p[10]); }
             foreach (string n in p[1].Split(',')) if (n.Length > 0) o.Names.Add(n);
             return o;
         }
@@ -106,7 +179,10 @@ namespace ClaudeMultiSessionLauncher
         {
             var parts = new List<string>();
             parts.Add(Monitor == 0 ? "주 모니터" : "모니터 " + (Monitor + 1));
-            parts.Add(NoLayout ? "배치 안 함" : (Cols == 0 ? "자동 배치" : Cols + "열"));
+            if (NoLayout) parts.Add("배치 안 함");
+            else if (Cols == 0 && Rows == 0) parts.Add("자동 배치");
+            else parts.Add(((Rows > 0 ? Rows + "행 " : "") + (Cols > 0 ? Cols + "열" : "")).Trim());
+            if (!NoLayout && !Tabs && Cells.Count > 0) parts.Add("셀 지정 " + Cells.Count + "개");
             if (Tabs) parts.Add("탭");
             if (Bypass) parts.Add("Bypass");
             if (!string.IsNullOrEmpty(Model)) parts.Add(Model);
@@ -198,6 +274,10 @@ namespace ClaudeMultiSessionLauncher
             sb.Append(" -Root ").Append(Q(root));
             sb.Append(" -Monitor ").Append(o.Monitor);
             sb.Append(" -Cols ").Append(o.Cols);
+            if (o.Rows > 0) sb.Append(" -Rows ").Append(o.Rows);
+            // 실행할 세션의 칸만 넘긴다
+            var cellArgs = o.Cells.Where(kv => o.Names.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
+            if (cellArgs.Count > 0) sb.Append(" -Cells ").Append(RunOptions.CellsText(cellArgs));
             if (!string.IsNullOrEmpty(o.Model)) sb.Append(" -Model ").Append(Q(o.Model));
             if (!string.IsNullOrEmpty(o.Effort)) sb.Append(" -Effort ").Append(Q(o.Effort));
             if (o.Bypass) sb.Append(" -Bypass");
@@ -352,6 +432,138 @@ namespace ClaudeMultiSessionLauncher
         }
     }
 
+    // 화면 색·글꼴·컨트롤 모양을 한곳에서 정한다
+    static class Ui
+    {
+        public static readonly Color Bg = Color.FromArgb(0xF3, 0xF4, 0xF6);        // 창 배경
+        public static readonly Color CardBg = Color.White;                          // 카드 배경
+        public static readonly Color Border = Color.FromArgb(0xD9, 0xDC, 0xE1);    // 테두리
+        public static readonly Color Text = Color.FromArgb(0x1F, 0x29, 0x37);      // 본문 글자
+        public static readonly Color Muted = Color.FromArgb(0x6B, 0x72, 0x80);     // 보조 글자
+        public static readonly Color Accent = Color.FromArgb(0xC2, 0x60, 0x3F);    // 강조색(주 버튼·선택 탭)
+        public static readonly Color AccentDark = Color.FromArgb(0xA6, 0x4C, 0x30);
+        public static readonly Color LogBg = Color.FromArgb(0x1E, 0x22, 0x2B);
+        public static readonly Color LogText = Color.FromArgb(0xE5, 0xE7, 0xEB);
+        public static readonly Font BaseFont = new Font("Segoe UI", 9.5F);
+        public static readonly Font BoldFont = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+        static readonly Color Hover = Color.FromArgb(0xF3, 0xF4, 0xF6);
+        static readonly Color Pressed = Color.FromArgb(0xE5, 0xE7, 0xEB);
+
+        // 플랫 버튼. primary 면 강조색으로 채운다. 비활성일 때는 회색으로 보인다.
+        public static void StyleButton(Button b, bool primary)
+        {
+            b.FlatStyle = FlatStyle.Flat;
+            b.UseVisualStyleBackColor = false;
+            b.FlatAppearance.BorderSize = 1;
+            if (primary) b.Font = BoldFont;
+            Action apply = delegate
+            {
+                if (b.Enabled)
+                {
+                    b.BackColor = primary ? Accent : Color.White;
+                    b.ForeColor = primary ? Color.White : Text;
+                    b.FlatAppearance.BorderColor = primary ? Accent : Border;
+                    b.FlatAppearance.MouseOverBackColor = primary ? AccentDark : Hover;
+                    b.FlatAppearance.MouseDownBackColor = primary ? AccentDark : Pressed;
+                    b.Cursor = Cursors.Hand;
+                }
+                else
+                {
+                    b.BackColor = Hover;
+                    b.ForeColor = Color.FromArgb(0x9C, 0xA3, 0xAF);
+                    b.FlatAppearance.BorderColor = Border;
+                    b.FlatAppearance.MouseOverBackColor = Hover;
+                    b.FlatAppearance.MouseDownBackColor = Hover;
+                    b.Cursor = Cursors.Default;
+                }
+            };
+            b.EnabledChanged += delegate { apply(); };
+            apply();
+        }
+
+        // 결과 창: 어두운 바탕에 고정폭 글꼴
+        public static void StyleLog(TextBox t)
+        {
+            t.BackColor = LogBg;
+            t.ForeColor = LogText;
+            t.Font = new Font("Consolas", 9.5F);
+            t.BorderStyle = BorderStyle.FixedSingle;
+        }
+
+        public static void StyleDialog(Form f)
+        {
+            f.BackColor = Bg;
+            f.ForeColor = Text;
+        }
+
+        // 입력 칸(TextBox·NumericUpDown)의 입체 테두리를 1px 평면 테두리로 바꾼다
+        public static void FlattenInputs(Control root)
+        {
+            foreach (Control c in root.Controls)
+            {
+                var tb = c as TextBox;
+                var nud = c as NumericUpDown;
+                if (tb != null && tb.BorderStyle == BorderStyle.Fixed3D) tb.BorderStyle = BorderStyle.FixedSingle;
+                if (nud != null) nud.BorderStyle = BorderStyle.FixedSingle;
+                FlattenInputs(c);
+            }
+        }
+
+        // 미리보기 칸: 옅은 바탕의 읽기 전용 상자
+        public static void StylePreview(TextBox t)
+        {
+            t.BackColor = Color.FromArgb(0xF9, 0xFA, 0xFB);
+            t.ForeColor = Muted;
+            t.BorderStyle = BorderStyle.FixedSingle;
+        }
+    }
+
+    // 테두리가 있는 흰 상자
+    class Card : Panel
+    {
+        public Card()
+        {
+            BackColor = Ui.CardBg;
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (var pen = new Pen(Ui.Border)) e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+    }
+
+    // 위쪽 탭 바의 탭 하나: 글자 + 고르면 강조색 밑줄
+    class NavTab : Control
+    {
+        bool selected, hover;
+
+        public NavTab(string text)
+        {
+            Text = text;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.Selectable, false);
+            Cursor = Cursors.Hand;
+            BackColor = Color.White;
+        }
+
+        public bool Selected { get { return selected; } set { selected = value; Invalidate(); } }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(hover && !selected ? Color.FromArgb(0xF9, 0xFA, 0xFB) : BackColor);
+            Color fg = selected ? Ui.Accent : (hover ? Ui.Text : Ui.Muted);
+            TextRenderer.DrawText(e.Graphics, Text, selected ? Ui.BoldFont : Ui.BaseFont, new Rectangle(0, 0, Width, Height - 3), fg,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            if (selected) using (var br = new SolidBrush(Ui.Accent)) e.Graphics.FillRectangle(br, 10, Height - 3, Width - 20, 3);
+        }
+    }
+
     class MainForm : Form
     {
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
@@ -366,9 +578,14 @@ namespace ClaudeMultiSessionLauncher
         readonly List<KeyValuePair<Control, AnchorStyles>> pendingAnchors = new List<KeyValuePair<Control, AnchorStyles>>();
         readonly int startTab;
         bool busy;   // 열기·미리보기·세션 추가 중에는 다른 작업을 막는다
+        Panel[] pages;       // 탭마다 한 장씩(실행·클론·등록)
+        NavTab[] navs;
+        readonly ToolTip tip = new ToolTip();
 
         // 실행 탭
-        ComboBox cmbProject, cmbMonitor, cmbCols, cmbModel, cmbEffort;
+        ComboBox cmbProject, cmbMonitor, cmbCols, cmbRows, cmbModel, cmbEffort;
+        Dictionary<string, GridCell> cellMap = new Dictionary<string, GridCell>();   // 셀 지정(세션 글자 → 칸)
+        Label lblCells;
         const string NoneLabel = "(지정 안 함)";
         FlowLayoutPanel flpSessions;
         CheckBox chkBypass, chkNoLayout, chkTabs, chkClose;
@@ -396,11 +613,13 @@ namespace ClaudeMultiSessionLauncher
             s = settings;
             this.startTab = startTab;
             Text = "Claude Multi Session Launcher";
-            Font = SystemFonts.MessageBoxFont;
+            Font = Ui.BaseFont;
+            BackColor = Ui.Bg;
+            ForeColor = Ui.Text;
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(700, 700);
-            MinimumSize = new Size(716, 680);
+            ClientSize = new Size(720, 780);
+            MinimumSize = new Size(736, 750);
             StartPosition = FormStartPosition.CenterScreen;
             BuildUi();
             LoadState();
@@ -410,7 +629,7 @@ namespace ClaudeMultiSessionLauncher
                 pendingAnchors.Clear();
                 // 등록된 프로젝트가 없으면 실행할 것이 없으므로 클론 탭으로 연다
                 int tab = s.Projects.Count == 0 ? 1 : this.startTab;
-                if (tab > 0 && Controls.Count > 0 && Controls[0] is TabControl) ((TabControl)Controls[0]).SelectedIndex = tab;
+                if (tab > 0) ShowPage(tab);
             };
             FormClosing += delegate { try { s.Last = Collect(); s.Save(); } catch (Exception) { } };
         }
@@ -418,124 +637,193 @@ namespace ClaudeMultiSessionLauncher
         T Anchored<T>(T c, AnchorStyles a) where T : Control { pendingAnchors.Add(new KeyValuePair<Control, AnchorStyles>(c, a)); return c; }
 
         // ───────── 화면 구성 ─────────
+        // 위: 탭 바(NavTab 셋) / 아래: 탭마다 한 장씩 쓰는 페이지(Panel). 페이지는 모두 Fill 로 겹쳐 두고
+        // 고른 페이지만 맨 앞으로 가져온다(숨기면 크기 계산이 어긋나 Anchor 가 틀어진다).
         void BuildUi()
         {
-            var tabs = new TabControl { Dock = DockStyle.Fill };
-            var run = new TabPage("실행");
-            var clone = new TabPage("클론");
-            tabs.TabPages.Add(run);
-            var register = new TabPage("등록");
-            tabs.TabPages.Add(clone);
-            tabs.TabPages.Add(register);
-            Controls.Add(tabs);
-            BuildRunTab(run);
-            BuildCloneTab(clone);
-            BuildRegisterTab(register);
+            pages = new Panel[3];
+            for (int i = 0; i < pages.Length; i++)
+            {
+                pages[i] = new Panel { Dock = DockStyle.Fill, BackColor = Ui.Bg };
+                Controls.Add(pages[i]);
+            }
+            var header = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = Color.White };
+            header.Paint += delegate(object sender, PaintEventArgs e)
+            {
+                using (var pen = new Pen(Ui.Border)) e.Graphics.DrawLine(pen, 0, header.Height - 1, header.Width, header.Height - 1);
+            };
+            string[] titles = { "실행", "클론", "등록" };
+            navs = new NavTab[titles.Length];
+            for (int i = 0; i < titles.Length; i++)
+            {
+                int index = i;
+                navs[i] = new NavTab(titles[i]) { Left = 12 + i * 92, Top = 0, Width = 92, Height = 46 };
+                navs[i].Click += delegate { ShowPage(index); };
+                header.Controls.Add(navs[i]);
+            }
+            Controls.Add(header);   // 나중에 넣은 것이 먼저 자리를 잡으므로 헤더가 맨 위에 붙는다
+            BuildRunTab(pages[0]);
+            BuildCloneTab(pages[1]);
+            BuildRegisterTab(pages[2]);
+            Ui.FlattenInputs(this);
+            ShowPage(0);
+        }
+
+        void ShowPage(int index)
+        {
+            for (int i = 0; i < pages.Length; i++)
+            {
+                navs[i].Selected = i == index;
+                pages[i].Enabled = i == index;   // 가려진 페이지의 컨트롤이 Tab 키로 잡히지 않게
+            }
+            pages[index].BringToFront();
         }
 
         static Label L(string text, int x, int y, int w) { return new Label { Text = text, Left = x, Top = y + 4, Width = w, AutoSize = false }; }
 
-        void BuildRunTab(TabPage t)
+        // 흰 카드 하나(제목 + 테두리). 안의 컨트롤은 카드 왼쪽 위를 기준으로 놓는다.
+        Card AddCard(Control page, string title, int top, int height)
         {
-            t.Controls.Add(L("프로젝트", 14, 14, 80));
-            cmbProject = new ComboBox { Left = 100, Top = 14, Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
-            cmbProject.SelectedIndexChanged += delegate { if (!loading) OnProjectChanged(); };
-            t.Controls.Add(cmbProject);
+            var c = new Card { Left = 16, Top = top, Width = 688, Height = height };
+            c.Controls.Add(new Label { Text = title, Left = 16, Top = 8, Width = 400, Height = 22, AutoSize = false, Font = Ui.BoldFont, ForeColor = Ui.Text });
+            Anchored(c, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
+            page.Controls.Add(c);
+            return c;
+        }
 
-            t.Controls.Add(L("세션", 14, 50, 80));
-            flpSessions = new FlowLayoutPanel { Left = 100, Top = 46, Width = 480, Height = 64, WrapContents = true, AutoScroll = true };
-            t.Controls.Add(flpSessions);
-            var btnAll = new Button { Text = "전체 선택", Left = 590, Top = 46, Width = 80, Height = 28 };
-            var btnNone = new Button { Text = "전체 해제", Left = 590, Top = 78, Width = 80, Height = 28 };
+        void BuildRunTab(Control t)
+        {
+            // ── 세션 ──
+            var c1 = AddCard(t, "세션", 12, 142);
+            c1.Controls.Add(L("프로젝트", 16, 34, 80));
+            cmbProject = new ComboBox { Left = 100, Top = 34, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbProject.SelectedIndexChanged += delegate { if (!loading) OnProjectChanged(); };
+            c1.Controls.Add(cmbProject);
+
+            c1.Controls.Add(L("세션", 16, 72, 80));
+            flpSessions = new FlowLayoutPanel { Left = 100, Top = 70, Width = 470, Height = 58, WrapContents = true, AutoScroll = true };
+            c1.Controls.Add(flpSessions);
+            var btnAll = new Button { Text = "전체 선택", Left = 584, Top = 70, Width = 88, Height = 28 };
+            var btnNone = new Button { Text = "전체 해제", Left = 584, Top = 102, Width = 88, Height = 28 };
+            Ui.StyleButton(btnAll, false);
+            Ui.StyleButton(btnNone, false);
             btnAll.Click += delegate { SetAllSessions(true); };
             btnNone.Click += delegate { SetAllSessions(false); };
-            t.Controls.Add(btnAll);
-            t.Controls.Add(btnNone);
+            c1.Controls.Add(btnAll);
+            c1.Controls.Add(btnNone);
 
-            t.Controls.Add(L("모니터", 14, 122, 80));
-            cmbMonitor = new ComboBox { Left = 100, Top = 122, Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
+            // ── 창 배치 ──
+            var c2 = AddCard(t, "창 배치", 162, 112);
+            c2.Controls.Add(L("모니터", 16, 34, 80));
+            cmbMonitor = new ComboBox { Left = 100, Top = 34, Width = 250, DropDownStyle = ComboBoxStyle.DropDownList };
             var screens = ScreensInOrder();
             for (int i = 0; i < screens.Count; i++)
                 cmbMonitor.Items.Add((i == 0 ? "주 모니터" : "모니터 " + (i + 1)) + " (" + screens[i].Bounds.Width + "x" + screens[i].Bounds.Height + ")");
-            t.Controls.Add(cmbMonitor);
-            t.Controls.Add(L("열 수", 380, 122, 50));
-            cmbCols = new ComboBox { Left = 436, Top = 122, Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            c2.Controls.Add(cmbMonitor);
+            c2.Controls.Add(L("열 수", 366, 34, 50));
+            cmbCols = new ComboBox { Left = 420, Top = 34, Width = 90, DropDownStyle = ComboBoxStyle.DropDownList };
             cmbCols.Items.Add("자동");
-            for (int c = 1; c <= 8; c++) cmbCols.Items.Add(c + "열");
-            t.Controls.Add(cmbCols);
+            for (int c = 1; c <= GridLayout.MaxSize; c++) cmbCols.Items.Add(c + "열");
+            c2.Controls.Add(cmbCols);
+            c2.Controls.Add(L("행 수", 526, 34, 44));
+            cmbRows = new ComboBox { Left = 574, Top = 34, Width = 90, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbRows.Items.Add("자동");
+            for (int r = 1; r <= GridLayout.MaxSize; r++) cmbRows.Items.Add(r + "행");
+            cmbRows.SelectedIndex = 0;
+            c2.Controls.Add(cmbRows);
 
+            // 셀 지정: 세션마다 놓을 칸(예: 1행 2열에 A, 2행 3열에 B)을 고른다
+            c2.Controls.Add(L("셀 배치", 16, 72, 80));
+            var btnCells = new Button { Text = "셀 지정…", Left = 100, Top = 70, Width = 110, Height = 30 };
+            Ui.StyleButton(btnCells, false);
+            btnCells.Click += delegate { AskCells(); };
+            c2.Controls.Add(btnCells);
+            lblCells = new Label { Left = 222, Top = 76, Width = 442, AutoSize = false, ForeColor = Ui.Muted };
+            c2.Controls.Add(lblCells);
+
+            // ── Claude 옵션 ──
             // 모델은 직접 입력도 가능(별칭 sonnet/opus 나 전체 모델 ID). 비우거나 "(지정 안 함)" 이면 --model 을 붙이지 않는다.
-            t.Controls.Add(L("모델", 14, 158, 80));
-            cmbModel = new ComboBox { Left = 100, Top = 158, Width = 260, DropDownStyle = ComboBoxStyle.DropDown };
+            var c3 = AddCard(t, "Claude 옵션", 282, 134);
+            c3.Controls.Add(L("모델", 16, 34, 80));
+            cmbModel = new ComboBox { Left = 100, Top = 34, Width = 250, DropDownStyle = ComboBoxStyle.DropDown };
             cmbModel.Items.AddRange(new object[] { NoneLabel, "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-haiku-5-5", "sonnet", "opus", "haiku", "fable" });
             cmbModel.Text = RunOptions.DefaultModel;
-            t.Controls.Add(cmbModel);
-            t.Controls.Add(L("Effort", 380, 158, 50));
-            cmbEffort = new ComboBox { Left = 436, Top = 158, Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            c3.Controls.Add(cmbModel);
+            c3.Controls.Add(L("Effort", 366, 34, 50));
+            cmbEffort = new ComboBox { Left = 420, Top = 34, Width = 90, DropDownStyle = ComboBoxStyle.DropDownList };
             cmbEffort.Items.AddRange(new object[] { NoneLabel, "low", "medium", "high", "xhigh", "max" });
             cmbEffort.SelectedItem = RunOptions.DefaultEffort;
-            t.Controls.Add(cmbEffort);
+            c3.Controls.Add(cmbEffort);
 
-            chkBypass = new CheckBox { Text = "권한 확인 건너뛰기 (--dangerously-skip-permissions)", Left = 100, Top = 194, Width = 540 };
-            chkNoLayout = new CheckBox { Text = "창 위치·크기 배치 안 함 (Windows Terminal 기본값)", Left = 100, Top = 220, Width = 540 };
-            chkTabs = new CheckBox { Text = "한 창의 탭으로 열기 (이 경우 배치는 적용되지 않음)", Left = 100, Top = 246, Width = 540 };
-            chkClose = new CheckBox { Text = "열기 후 런처 닫기", Left = 100, Top = 272, Width = 540 };
-            t.Controls.AddRange(new Control[] { chkBypass, chkNoLayout, chkTabs, chkClose });
+            chkBypass = new CheckBox { Text = "권한 확인 건너뛰기 (--dangerously-skip-permissions)", Left = 100, Top = 72, Width = 370 };
+            chkNoLayout = new CheckBox { Text = "창 위치·크기 배치 안 함", Left = 100, Top = 98, Width = 370 };
+            chkTabs = new CheckBox { Text = "한 창의 탭으로 열기", Left = 480, Top = 72, Width = 190 };
+            chkClose = new CheckBox { Text = "열기 후 런처 닫기", Left = 480, Top = 98, Width = 190 };
+            tip.SetToolTip(chkNoLayout, "Windows Terminal 이 정하는 기본 위치·크기로 엽니다.");
+            tip.SetToolTip(chkTabs, "한 창의 탭으로 열면 창 배치(열·행·셀 지정)는 적용되지 않습니다.");
+            c3.Controls.AddRange(new Control[] { chkBypass, chkNoLayout, chkTabs, chkClose });
 
-            btnPreview = new Button { Text = "미리보기", Left = 100, Top = 308, Width = 120, Height = 34 };
-            btnRun = new Button { Text = "열기", Left = 230, Top = 308, Width = 150, Height = 34 };
+            // ── 실행 ──
+            btnPreview = new Button { Text = "미리보기", Left = 16, Top = 424, Width = 120, Height = 38 };
+            btnRun = new Button { Text = "열기", Left = 146, Top = 424, Width = 160, Height = 38 };
+            Ui.StyleButton(btnPreview, false);
+            Ui.StyleButton(btnRun, true);
             btnPreview.Click += delegate { Execute(Collect(), true); };
             btnRun.Click += delegate { Execute(Collect(), false); };
             t.Controls.Add(btnPreview);
             t.Controls.Add(btnRun);
-            lblStatus = new Label { Left = 392, Top = 314, Width = 280, AutoSize = false, ForeColor = Color.DimGray };
+            lblStatus = new Label { Left = 320, Top = 435, Width = 384, AutoSize = false, ForeColor = Ui.Muted };
             t.Controls.Add(lblStatus);
 
-            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 14, Top = 358, Width = 650, AutoSize = false });
-            lstRecent = new ListBox { Left = 14, Top = 382, Width = 656, Height = 80, IntegralHeight = false };
+            t.Controls.Add(new Label { Text = "최근 실행 — 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행합니다", Left = 16, Top = 472, Width = 688, AutoSize = false, ForeColor = Ui.Muted });
+            lstRecent = new ListBox { Left = 16, Top = 494, Width = 688, Height = 66, IntegralHeight = false, BorderStyle = BorderStyle.FixedSingle };
             Anchored(lstRecent, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
             lstRecent.SelectedIndexChanged += delegate { OnRecentSelected(); };
             lstRecent.DoubleClick += delegate { if (lstRecent.SelectedIndex >= 0) Execute(Collect(), false); };
             t.Controls.Add(lstRecent);
 
-            t.Controls.Add(new Label { Text = "결과", Left = 14, Top = 470, Width = 100, AutoSize = false });
-            lblRoot = new Label { Left = 120, Top = 474, Width = 550, AutoSize = false, ForeColor = Color.DimGray };
+            t.Controls.Add(new Label { Text = "결과", Left = 16, Top = 570, Width = 44, AutoSize = false, Font = Ui.BoldFont });
+            lblRoot = new Label { Left = 64, Top = 570, Width = 640, AutoSize = false, ForeColor = Ui.Muted };
             t.Controls.Add(lblRoot);
-            txtLog = new TextBox { Left = 14, Top = 492, Width = 656, Height = 164, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            txtLog = new TextBox { Left = 16, Top = 592, Width = 688, Height = 130, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            Ui.StyleLog(txtLog);
             Anchored(txtLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
             t.Controls.Add(txtLog);
         }
 
-        void BuildCloneTab(TabPage t)
+        void BuildCloneTab(Control t)
         {
-            t.Controls.Add(L("폴더명", 14, 14, 90));
-            txtName = new TextBox { Left = 110, Top = 14, Width = 220 };
-            t.Controls.Add(txtName);
-            t.Controls.Add(L("원격 주소", 14, 50, 90));
-            txtUrl = new TextBox { Left = 110, Top = 50, Width = 460 };
+            var c = AddCard(t, "원격 저장소 클론", 12, 346);
+            c.Controls.Add(L("폴더명", 16, 34, 90));
+            txtName = new TextBox { Left = 112, Top = 34, Width = 220 };
+            c.Controls.Add(txtName);
+            c.Controls.Add(L("원격 주소", 16, 70, 90));
+            txtUrl = new TextBox { Left = 112, Top = 70, Width = 450 };
             Anchored(txtUrl, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtUrl);
+            c.Controls.Add(txtUrl);
             // 저장소 주소를 찾으러 GitHub 를 기본 브라우저로 연다
-            var btnGitHub = new Button { Text = "GitHub", Left = 580, Top = 48, Width = 80, Height = 28 };
+            var btnGitHub = new Button { Text = "GitHub", Left = 574, Top = 68, Width = 90, Height = 28 };
+            Ui.StyleButton(btnGitHub, false);
             Anchored(btnGitHub, AnchorStyles.Top | AnchorStyles.Right);
             btnGitHub.Click += delegate
             {
                 try { Process.Start("https://github.com"); }
                 catch (Exception ex) { MessageBox.Show(this, "브라우저를 열 수 없습니다: " + ex.Message, Text); }
             };
-            t.Controls.Add(btnGitHub);
-            t.Controls.Add(L("갯수", 14, 86, 90));
-            nudCount = new NumericUpDown { Left = 110, Top = 86, Width = 60, Minimum = 1, Maximum = 26, Value = 6 };
-            t.Controls.Add(nudCount);
-            t.Controls.Add(L("세션 이름 접두사", 200, 86, 120));
-            txtTitle = new TextBox { Left = 326, Top = 86, Width = 334 };   // 원격 주소 칸과 오른쪽 끝을 맞춘다
+            c.Controls.Add(btnGitHub);
+            c.Controls.Add(L("갯수", 16, 106, 90));
+            nudCount = new NumericUpDown { Left = 112, Top = 106, Width = 60, Minimum = 1, Maximum = 26, Value = 6 };
+            c.Controls.Add(nudCount);
+            c.Controls.Add(L("세션 이름 접두사", 200, 106, 120));
+            txtTitle = new TextBox { Left = 328, Top = 106, Width = 336 };   // 원격 주소 칸과 오른쪽 끝을 맞춘다
             Anchored(txtTitle, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtTitle);
-            t.Controls.Add(L("저장 위치", 14, 122, 90));
-            txtRoot = new TextBox { Left = 110, Top = 122, Width = 460 };
+            c.Controls.Add(txtTitle);
+            c.Controls.Add(L("저장 위치", 16, 142, 90));
+            txtRoot = new TextBox { Left = 112, Top = 142, Width = 450 };
             Anchored(txtRoot, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtRoot);
-            var btnBrowse = new Button { Text = "찾아보기", Left = 580, Top = 120, Width = 80, Height = 28 };
+            c.Controls.Add(txtRoot);
+            var btnBrowse = new Button { Text = "찾아보기", Left = 574, Top = 140, Width = 90, Height = 28 };
+            Ui.StyleButton(btnBrowse, false);
             Anchored(btnBrowse, AnchorStyles.Top | AnchorStyles.Right);
             btnBrowse.Click += delegate
             {
@@ -545,22 +833,24 @@ namespace ClaudeMultiSessionLauncher
                     if (d.ShowDialog(this) == DialogResult.OK) txtRoot.Text = d.SelectedPath;
                 }
             };
-            t.Controls.Add(btnBrowse);
+            c.Controls.Add(btnBrowse);
 
             // 미리보기: 저장 폴더 한 줄 + 만들어질 "[세션명] 폴더명" 전부. 줄이 많으면 스크롤된다.
             lblClonePreview = new TextBox
             {
-                Left = 110, Top = 158, Width = 550, Height = 204, Multiline = true, ReadOnly = true, WordWrap = false,
-                ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None, TabStop = false,
-                BackColor = SystemColors.Control, ForeColor = Color.DimGray
+                Left = 112, Top = 182, Width = 552, Height = 150, Multiline = true, ReadOnly = true, WordWrap = false,
+                ScrollBars = ScrollBars.Vertical, TabStop = false
             };
+            Ui.StylePreview(lblClonePreview);
             Anchored(lblClonePreview, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(lblClonePreview);
-            btnClone = new Button { Text = "클론", Left = 110, Top = 368, Width = 140, Height = 34 };
+            c.Controls.Add(lblClonePreview);
+            btnClone = new Button { Text = "클론", Left = 16, Top = 370, Width = 140, Height = 38 };
+            Ui.StyleButton(btnClone, true);
             btnClone.Click += delegate { StartClone(); };
             t.Controls.Add(btnClone);
 
-            txtCloneLog = new TextBox { Left = 14, Top = 414, Width = 656, Height = 240, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            txtCloneLog = new TextBox { Left = 16, Top = 418, Width = 688, Height = 304, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            Ui.StyleLog(txtCloneLog);
             Anchored(txtCloneLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
             t.Controls.Add(txtCloneLog);
 
@@ -605,13 +895,15 @@ namespace ClaudeMultiSessionLauncher
 
         // 이미 클론된 프로젝트를 실행 탭에 등록한다. 프로젝트 폴더(예: C:\workspace\safed)를 고르면
         // 그 아래 {폴더명}-a ~ 를 훑어 갯수·원격 주소·세션 이름 접두사를 채운다. 클론은 하지 않는다.
-        void BuildRegisterTab(TabPage t)
+        void BuildRegisterTab(Control t)
         {
-            t.Controls.Add(L("프로젝트 폴더", 14, 14, 90));
-            txtRegPath = new TextBox { Left = 110, Top = 14, Width = 460 };
+            var c = AddCard(t, "이미 클론된 프로젝트 등록", 12, 346);
+            c.Controls.Add(L("프로젝트 폴더", 16, 34, 90));
+            txtRegPath = new TextBox { Left = 112, Top = 34, Width = 450 };
             Anchored(txtRegPath, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtRegPath);
-            var btnBrowse = new Button { Text = "찾아보기", Left = 580, Top = 12, Width = 80, Height = 28 };
+            c.Controls.Add(txtRegPath);
+            var btnBrowse = new Button { Text = "찾아보기", Left = 574, Top = 32, Width = 90, Height = 28 };
+            Ui.StyleButton(btnBrowse, false);
             Anchored(btnBrowse, AnchorStyles.Top | AnchorStyles.Right);
             btnBrowse.Click += delegate
             {
@@ -623,40 +915,42 @@ namespace ClaudeMultiSessionLauncher
                     if (d.ShowDialog(this) == DialogResult.OK) txtRegPath.Text = d.SelectedPath;
                 }
             };
-            t.Controls.Add(btnBrowse);
+            c.Controls.Add(btnBrowse);
 
-            t.Controls.Add(L("원격 주소", 14, 50, 90));
-            txtRegUrl = new TextBox { Left = 110, Top = 50, Width = 550 };
+            c.Controls.Add(L("원격 주소", 16, 70, 90));
+            txtRegUrl = new TextBox { Left = 112, Top = 70, Width = 552 };
             Anchored(txtRegUrl, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtRegUrl);
+            c.Controls.Add(txtRegUrl);
 
-            t.Controls.Add(L("갯수", 14, 86, 90));
-            nudRegCount = new NumericUpDown { Left = 110, Top = 86, Width = 60, Minimum = 1, Maximum = 26, Value = 6 };
-            t.Controls.Add(nudRegCount);
-            t.Controls.Add(L("세션 이름 접두사", 200, 86, 120));
-            txtRegTitle = new TextBox { Left = 326, Top = 86, Width = 334 };
+            c.Controls.Add(L("갯수", 16, 106, 90));
+            nudRegCount = new NumericUpDown { Left = 112, Top = 106, Width = 60, Minimum = 1, Maximum = 26, Value = 6 };
+            c.Controls.Add(nudRegCount);
+            c.Controls.Add(L("세션 이름 접두사", 200, 106, 120));
+            txtRegTitle = new TextBox { Left = 328, Top = 106, Width = 336 };
             Anchored(txtRegTitle, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(txtRegTitle);
+            c.Controls.Add(txtRegTitle);
 
-            t.Controls.Add(new Label
+            c.Controls.Add(new Label
             {
                 Text = "폴더를 고르면 갯수·원격 주소를 폴더에서 읽어 채웁니다. 갯수는 고쳐도 됩니다. 원격 주소는 세션 추가(+ 추가)에만 필요합니다.",
-                Left = 110, Top = 122, Width = 550, Height = 32, AutoSize = false, ForeColor = Color.DimGray
+                Left = 112, Top = 138, Width = 552, Height = 34, AutoSize = false, ForeColor = Ui.Muted
             });
 
             lblRegPreview = new TextBox
             {
-                Left = 110, Top = 158, Width = 550, Height = 204, Multiline = true, ReadOnly = true, WordWrap = false,
-                ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None, TabStop = false,
-                BackColor = SystemColors.Control, ForeColor = Color.DimGray
+                Left = 112, Top = 176, Width = 552, Height = 156, Multiline = true, ReadOnly = true, WordWrap = false,
+                ScrollBars = ScrollBars.Vertical, TabStop = false
             };
+            Ui.StylePreview(lblRegPreview);
             Anchored(lblRegPreview, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right);
-            t.Controls.Add(lblRegPreview);
-            btnRegister = new Button { Text = "등록", Left = 110, Top = 368, Width = 140, Height = 34 };
+            c.Controls.Add(lblRegPreview);
+            btnRegister = new Button { Text = "등록", Left = 16, Top = 370, Width = 140, Height = 38 };
+            Ui.StyleButton(btnRegister, true);
             btnRegister.Click += delegate { StartRegister(); };
             t.Controls.Add(btnRegister);
 
-            txtRegLog = new TextBox { Left = 14, Top = 414, Width = 656, Height = 240, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            txtRegLog = new TextBox { Left = 16, Top = 418, Width = 688, Height = 304, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+            Ui.StyleLog(txtRegLog);
             Anchored(txtRegLog, AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom);
             t.Controls.Add(txtRegLog);
 
@@ -822,16 +1116,19 @@ namespace ClaudeMultiSessionLauncher
             foreach (string l in ProjectDef.Letters(p.Count))
             {
                 var cb = new CheckBox { Text = l.ToUpperInvariant(), Tag = l, Width = 52, Checked = selected == null || selected.Contains(l) };
+                cb.CheckedChanged += delegate { UpdateCellSummary(); };
                 flpSessions.Controls.Add(cb);
             }
             // 마지막 칸: 세션(폴더)을 더 클론해 늘리는 버튼. Z(26개)까지만.
             if (p.Count < 26)
             {
                 var add = new Button { Text = "+ 추가", AutoSize = true, Enabled = !busy };
+                Ui.StyleButton(add, false);
                 add.Click += delegate { AddSessions(); };
                 flpSessions.Controls.Add(add);
             }
             flpSessions.ResumeLayout();
+            UpdateCellSummary();
         }
 
         IEnumerable<CheckBox> SessionBoxes() { return flpSessions.Controls.OfType<CheckBox>(); }
@@ -839,10 +1136,147 @@ namespace ClaudeMultiSessionLauncher
         void OnProjectChanged()
         {
             var p = s.Find(cmbProject.SelectedItem as string);
+            cellMap = new Dictionary<string, GridCell>();   // 다른 프로젝트의 칸 지정은 이어받지 않는다
             if (p != null) RebuildSessions(p, null);
         }
 
         void SetAllSessions(bool on) { foreach (CheckBox cb in SessionBoxes()) cb.Checked = on; }
+
+        // 체크된 세션 중 칸이 지정된 것만(세션 글자 → 칸)
+        Dictionary<string, GridCell> SelectedCells()
+        {
+            var r = new Dictionary<string, GridCell>();
+            foreach (CheckBox cb in SessionBoxes())
+            {
+                GridCell g;
+                string l = (string)cb.Tag;
+                if (cb.Checked && cellMap.TryGetValue(l, out g)) r[l] = g;
+            }
+            return r;
+        }
+
+        void UpdateCellSummary()
+        {
+            if (lblCells == null) return;
+            var cells = SelectedCells();
+            lblCells.Text = cells.Count == 0
+                ? "지정 안 함 — 선택한 세션을 빈 칸에 순서대로 놓습니다"
+                : string.Join(", ", cells.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                    .Select(kv => kv.Key.ToUpperInvariant() + "→" + kv.Value.Row + "행" + kv.Value.Col + "열").ToArray());
+        }
+
+        // 세션마다 놓을 칸을 고르는 창. 확인하면 행 수·열 수·칸 지정을 실행 탭에 반영한다.
+        void AskCells()
+        {
+            var names = SessionBoxes().Where(cb => cb.Checked).Select(cb => (string)cb.Tag).ToList();
+            if (names.Count == 0) { Status("셀을 지정하려면 세션을 먼저 선택하세요."); return; }
+            var cur = SelectedCells();
+
+            int rows0, cols0;
+            GridLayout.Resolve(names.Count, Math.Max(0, cmbCols.SelectedIndex), Math.Max(0, cmbRows.SelectedIndex), cur.Values, out rows0, out cols0);
+
+            using (var f = new Form())
+            {
+                f.Text = "셀 지정 — 세션을 놓을 칸 고르기";
+                f.Font = Font;
+                f.AutoScaleDimensions = new SizeF(96F, 96F);
+                f.AutoScaleMode = AutoScaleMode.Dpi;
+                f.ClientSize = new Size(680, 470);
+                Ui.StyleDialog(f);
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = false;
+                f.MinimizeBox = false;
+                f.ShowInTaskbar = false;
+                f.StartPosition = FormStartPosition.CenterParent;
+
+                var nudRows = new NumericUpDown { Left = 70, Top = 14, Width = 60, Minimum = 1, Maximum = GridLayout.MaxSize, Value = Math.Min(GridLayout.MaxSize, rows0) };
+                var nudCols = new NumericUpDown { Left = 206, Top = 14, Width = 60, Minimum = 1, Maximum = GridLayout.MaxSize, Value = Math.Min(GridLayout.MaxSize, cols0) };
+                var hint = new Label
+                {
+                    Left = 14, Top = 48, Width = 652, Height = 36, AutoSize = false, ForeColor = Ui.Muted,
+                    Text = "칸마다 놓을 세션을 고르세요. 칸에 고르지 않은 세션은 비어 있는 칸을 위→아래, 왼→오른 순서로 채웁니다. 같은 세션을 두 칸에 둘 수는 없습니다."
+                };
+                var pnl = new Panel { Left = 14, Top = 88, Width = 652, Height = 330, AutoScroll = true, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White };
+
+                // "행,열" → 세션 글자. 다시 그리기 전에 화면의 선택을 여기에 모은다.
+                var chosen = new Dictionary<string, string>();
+                foreach (var kv in cur) chosen[kv.Value.Row + "," + kv.Value.Col] = kv.Key;
+
+                Action collect = delegate
+                {
+                    foreach (ComboBox cb in pnl.Controls.OfType<ComboBox>())
+                    {
+                        int[] pos = (int[])cb.Tag;
+                        string key = pos[0] + "," + pos[1];
+                        if (cb.SelectedIndex > 0) chosen[key] = names[cb.SelectedIndex - 1]; else chosen.Remove(key);
+                    }
+                };
+                Action build = delegate
+                {
+                    collect();
+                    pnl.SuspendLayout();
+                    var old = pnl.Controls.Cast<Control>().ToList();
+                    pnl.Controls.Clear();
+                    foreach (var c in old) c.Dispose();
+                    for (int r = 1; r <= (int)nudRows.Value; r++)
+                        for (int c = 1; c <= (int)nudCols.Value; c++)
+                        {
+                            int x = 8 + (c - 1) * 78, y = 6 + (r - 1) * 50;
+                            pnl.Controls.Add(new Label { Text = r + "행 " + c + "열", Left = x, Top = y, Width = 72, Height = 16, AutoSize = false, ForeColor = Ui.Muted });
+                            var combo = new ComboBox { Left = x, Top = y + 18, Width = 72, DropDownStyle = ComboBoxStyle.DropDownList, Tag = new[] { r, c } };
+                            combo.Items.Add("(자동)");
+                            foreach (string n in names) combo.Items.Add(n.ToUpperInvariant());
+                            string letter;
+                            combo.SelectedIndex = chosen.TryGetValue(r + "," + c, out letter) ? names.IndexOf(letter) + 1 : 0;
+                            // 한 세션은 한 칸에만: 다른 칸에 있던 같은 세션은 (자동)으로 돌린다
+                            ComboBox self = combo;
+                            self.SelectionChangeCommitted += delegate
+                            {
+                                if (self.SelectedIndex <= 0) return;
+                                foreach (ComboBox other in pnl.Controls.OfType<ComboBox>())
+                                    if (other != self && other.SelectedIndex == self.SelectedIndex) other.SelectedIndex = 0;
+                            };
+                            pnl.Controls.Add(combo);
+                        }
+                    pnl.ResumeLayout();
+                };
+                nudRows.ValueChanged += delegate { build(); };
+                nudCols.ValueChanged += delegate { build(); };
+
+                var clear = new Button { Text = "모두 비우기", Left = 14, Top = 428, Width = 110, Height = 30 };
+                clear.Click += delegate
+                {
+                    chosen.Clear();
+                    foreach (ComboBox cb in pnl.Controls.OfType<ComboBox>()) cb.SelectedIndex = 0;
+                };
+                var ok = new Button { Text = "확인", Left = 484, Top = 428, Width = 86, Height = 30, DialogResult = DialogResult.OK };
+                var cancel = new Button { Text = "취소", Left = 580, Top = 428, Width = 86, Height = 30, DialogResult = DialogResult.Cancel };
+                Ui.StyleButton(clear, false);
+                Ui.StyleButton(ok, true);
+                Ui.StyleButton(cancel, false);
+                f.Controls.AddRange(new Control[] { L("행 수", 14, 14, 50), nudRows, L("열 수", 150, 14, 50), nudCols, hint, pnl, clear, ok, cancel });
+                f.AcceptButton = ok;
+                f.CancelButton = cancel;
+                Ui.FlattenInputs(f);
+                build();
+
+                if (f.ShowDialog(this) != DialogResult.OK) return;
+
+                collect();
+                int rows = (int)nudRows.Value, cols = (int)nudCols.Value;
+                var result = new Dictionary<string, GridCell>();
+                for (int r = 1; r <= rows; r++)
+                    for (int c = 1; c <= cols; c++)
+                    {
+                        string letter;
+                        if (chosen.TryGetValue(r + "," + c, out letter)) result[letter] = new GridCell(r, c);
+                    }
+                cmbRows.SelectedIndex = rows;
+                cmbCols.SelectedIndex = cols;
+                cellMap = result;
+                UpdateCellSummary();
+            }
+        }
 
         void OnRecentSelected()
         {
@@ -862,6 +1296,9 @@ namespace ClaudeMultiSessionLauncher
             RebuildSessions(p, o.Names);
             cmbMonitor.SelectedIndex = o.Monitor >= 0 && o.Monitor < cmbMonitor.Items.Count ? o.Monitor : 0;
             cmbCols.SelectedIndex = o.Cols >= 0 && o.Cols < cmbCols.Items.Count ? o.Cols : 0;
+            cmbRows.SelectedIndex = o.Rows >= 0 && o.Rows < cmbRows.Items.Count ? o.Rows : 0;
+            cellMap = o.Cells.ToDictionary(kv => kv.Key, kv => new GridCell(kv.Value.Row, kv.Value.Col));
+            UpdateCellSummary();
             cmbModel.Text = string.IsNullOrEmpty(o.Model) ? NoneLabel : o.Model;
             int ei = string.IsNullOrEmpty(o.Effort) ? 0 : cmbEffort.Items.IndexOf(o.Effort);
             cmbEffort.SelectedIndex = ei >= 0 ? ei : 0;
@@ -878,6 +1315,8 @@ namespace ClaudeMultiSessionLauncher
                 Project = cmbProject.SelectedItem as string ?? "",
                 Monitor = Math.Max(0, cmbMonitor.SelectedIndex),
                 Cols = Math.Max(0, cmbCols.SelectedIndex),
+                Rows = Math.Max(0, cmbRows.SelectedIndex),
+                Cells = SelectedCells(),
                 Model = cmbModel.Text.Trim() == NoneLabel ? "" : Regex.Replace(cmbModel.Text, @"[^A-Za-z0-9._\[\]-]", ""),
                 Effort = cmbEffort.SelectedIndex <= 0 ? "" : (string)cmbEffort.SelectedItem,
                 Bypass = chkBypass.Checked,
@@ -1023,6 +1462,7 @@ namespace ClaudeMultiSessionLauncher
                 f.AutoScaleDimensions = new SizeF(96F, 96F);
                 f.AutoScaleMode = AutoScaleMode.Dpi;
                 f.ClientSize = new Size(440, 160);
+                Ui.StyleDialog(f);
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.MaximizeBox = false;
                 f.MinimizeBox = false;
@@ -1030,7 +1470,7 @@ namespace ClaudeMultiSessionLauncher
                 f.StartPosition = FormStartPosition.CenterParent;
 
                 var nud = new NumericUpDown { Left = 110, Top = 14, Width = 60, Minimum = 1, Maximum = 26 - p.Count, Value = 1 };
-                var preview = new Label { Left = 14, Top = 50, Width = 412, Height = 54, AutoSize = false, ForeColor = Color.DimGray };
+                var preview = new Label { Left = 14, Top = 50, Width = 412, Height = 54, AutoSize = false, ForeColor = Ui.Muted };
                 Action update = delegate
                 {
                     int n = (int)nud.Value;
@@ -1043,9 +1483,12 @@ namespace ClaudeMultiSessionLauncher
                 nud.TextChanged += delegate { update(); };
                 var ok = new Button { Text = "추가", Left = 246, Top = 116, Width = 86, Height = 30, DialogResult = DialogResult.OK };
                 var cancel = new Button { Text = "취소", Left = 340, Top = 116, Width = 86, Height = 30, DialogResult = DialogResult.Cancel };
+                Ui.StyleButton(ok, true);
+                Ui.StyleButton(cancel, false);
                 f.Controls.AddRange(new Control[] { L("추가할 개수", 14, 14, 90), nud, preview, ok, cancel });
                 f.AcceptButton = ok;
                 f.CancelButton = cancel;
+                Ui.FlattenInputs(f);
                 update();
                 return f.ShowDialog(this) == DialogResult.OK ? (int)nud.Value : 0;
             }
@@ -1199,6 +1642,31 @@ namespace ClaudeMultiSessionLauncher
                 var none2 = RunOptions.Parse(none.Serialize());
                 Check("모델·effort 지정 안 함도 왕복", none2 != null && none2.Model == "" && none2.Effort == "", none.Serialize());
 
+                // 셀 지정(1행2열에 A, 2행3열에 B)
+                var cellOpt = new RunOptions { Project = "demo", Rows = 2, Cols = 3 };
+                cellOpt.Names.AddRange(new[] { "a", "b", "c" });
+                cellOpt.Cells["a"] = new GridCell(1, 2);
+                cellOpt.Cells["b"] = new GridCell(2, 3);
+                var cellOpt2 = RunOptions.Parse(cellOpt.Serialize());
+                Check("셀 지정 직렬화 왕복", cellOpt2 != null && cellOpt2.Rows == 2 && cellOpt2.Cells.Count == 2
+                    && cellOpt2.Cells["a"].Row == 1 && cellOpt2.Cells["a"].Col == 2 && cellOpt2.Cells["b"].Row == 2 && cellOpt2.Cells["b"].Col == 3
+                    && cellOpt2.Serialize() == cellOpt.Serialize(), cellOpt.Serialize());
+                Check("예전 설정(행 수·셀 없음)은 자동 배치", oldFmt != null && oldFmt.Rows == 0 && oldFmt.Cells.Count == 0, "");
+                var badCells = RunOptions.ParseCells("a:1:2,zz,b:0:1,c:x:1,D:1:1,e:3:4");
+                Check("잘못된 셀 지정은 무시", badCells.Count == 2 && badCells.ContainsKey("a") && badCells.ContainsKey("e"), RunOptions.CellsText(badCells));
+                Check("Describe: 행·열·셀 지정", cellOpt.Describe().Contains("2행 3열") && cellOpt.Describe().Contains("셀 지정 2개"), cellOpt.Describe());
+                int gr, gc;
+                GridLayout.Resolve(6, 0, 0, new GridCell[0], out gr, out gc);
+                Check("격자: 6개 자동 → 2행 3열", gr == 2 && gc == 3, gr + "x" + gc);
+                GridLayout.Resolve(2, 5, 0, new GridCell[0], out gr, out gc);
+                Check("격자: 칸 지정이 없으면 창보다 많은 열은 줄임", gr == 1 && gc == 2, gr + "x" + gc);
+                GridLayout.Resolve(2, 3, 2, new GridCell[0], out gr, out gc);
+                Check("격자: 행·열을 모두 지정하면 그대로(2행 3열)", gr == 2 && gc == 3, gr + "x" + gc);
+                GridLayout.Resolve(2, 0, 0, new[] { new GridCell(1, 2), new GridCell(2, 3) }, out gr, out gc);
+                Check("격자: 지정한 칸이 밖이면 격자를 키움(2행 3열)", gr == 2 && gc == 3, gr + "x" + gc);
+                GridLayout.Resolve(5, 2, 1, new GridCell[0], out gr, out gc);
+                Check("격자: 칸이 모자라면 행을 늘림", gr == 3 && gc == 2, gr + "x" + gc);
+
                 if (Directory.Exists(home)) Directory.Delete(home, true);
                 var s = Settings.Load(home, "D:\\workspace");
                 Check("처음 실행: 내장 프로젝트 없음", s.Projects.Count == 0, s.Projects.Count.ToString());
@@ -1211,6 +1679,21 @@ namespace ClaudeMultiSessionLauncher
                 s.Last = o; s.UpsertProject(new ProjectDef { Name = "demo", Title = "DEMO-", Count = 2, Remote = "x" }); s.Save();
                 var s2 = Settings.Load(home, "D:\\workspace");
                 Check("설정 저장·복원", s2.Projects.Count == 1 && s2.Recent.Count == 5 && s2.Last != null && s2.Last.Serialize() == o.Serialize() && s2.Find("demo").Count == 2, "");
+
+                // 마지막 실행값의 셀 지정이 화면에 복원되고, 선택하지 않은 세션의 칸은 빠지는지
+                var s4 = Settings.Load(home, "D:\\workspace");
+                var last4 = new RunOptions { Project = "demo", Rows = 2, Cols = 3 };
+                last4.Names.AddRange(new[] { "a", "b" });
+                last4.Cells["a"] = new GridCell(1, 2);
+                last4.Cells["b"] = new GridCell(2, 3);
+                last4.Cells["c"] = new GridCell(1, 1);
+                s4.Last = last4;
+                using (var form4 = new MainForm(s4, 0))
+                {
+                    var got = form4.Collect();
+                    Check("폼이 행 수·열 수·셀 지정을 복원", got.Rows == 2 && got.Cols == 3 && got.Cells.Count == 2
+                        && got.Cells["a"].Row == 1 && got.Cells["a"].Col == 2 && got.Cells["b"].Row == 2 && got.Cells["b"].Col == 3 && !got.Cells.ContainsKey("c"), got.Serialize());
+                }
 
                 // 세션 추가 후 처리(화면은 띄우지 않고 폼만 만들어 확인): a,b,c 중 a,c 를 고른 상태에서 d,e 추가
                 var s3 = Settings.Load(home, "D:\\workspace");
@@ -1274,6 +1757,12 @@ namespace ClaudeMultiSessionLauncher
                     && args.Contains("-Names a,c") && args.Contains("-Root \"D:\\workspace\"") && args.Contains("-Monitor 1") && args.Contains("-Cols 2")
                     && args.Contains("-Bypass") && args.Contains("-DryRun") && !args.Contains("-NoLayout")
                     && args.Contains("-Model \"claude-sonnet-5-5\"") && args.Contains("-Effort \"high\""), args);
+                string argsCells = Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, cellOpt, true);
+                Check("스크립트 인자: 행 수·셀 지정", argsCells.Contains("-Rows 2") && argsCells.Contains("-Cols 3") && argsCells.Contains("-Cells a:1:2,b:2:3"), argsCells);
+                string argsNoCell = Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, o, true);
+                Check("셀 지정·행 수가 없으면 -Rows/-Cells 를 넘기지 않음", !argsNoCell.Contains("-Rows") && !argsNoCell.Contains("-Cells"), argsNoCell);
+                cellOpt.Cells["z"] = new GridCell(1, 1);   // 선택하지 않은 세션의 칸은 넘기지 않는다
+                Check("선택하지 않은 세션의 칸은 넘기지 않음", !Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, cellOpt, true).Contains("z:1:1"), "");
                 string argsNone = Launch.BuildArgs("C:\\w\\open-sessions.ps1", "D:\\workspace\\", p, none, true);
                 Check("지정 안 함이면 -Model/-Effort 를 넘기지 않음", !argsNone.Contains("-Model") && !argsNone.Contains("-Effort"), argsNone);
 

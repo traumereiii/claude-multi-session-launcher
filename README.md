@@ -73,10 +73,15 @@ D:\workspace\                    ← 작업 폴더(기본: 도구 폴더의 상�
 - 폴더 위치가 지금 작업 폴더와 다르면 확인 창에서 알려 주고, 등록하면 작업 폴더가 그 상위로 바뀐다(작업 폴더는 모든 프로젝트가 공유한다).
 - 같은 폴더명을 다시 등록하면 갯수·접두사·원격 주소가 갱신된다. 폴더는 건드리지 않는다.
 
-**실행 탭** — 프로젝트 · 세션(A~) · 모니터 · 열 수 · 옵션을 고르고 `열기`(`미리보기` 는 실행하지 않고 명령만 보여 준다).
+**실행 탭** — 프로젝트 · 세션(A~) · 모니터 · 열 수 · 행 수 · 셀 배치 · 옵션을 고르고 `열기`(`미리보기` 는 실행하지 않고 명령만 보여 준다).
 - 같은 이름의 세션이 있으면 이어서(`--resume`), 없으면 그 이름으로 새로(`--name`) 시작한다.
 - **모델 · Effort**: 기본값은 `claude-sonnet-5-5` · `high`. 모델은 목록에서 고르거나 직접 입력할 수 있고(별칭 `sonnet` `opus` 또는 전체 모델 ID), Effort 는 `low` `medium` `high` `xhigh` `max` 중에서 고른다. `(지정 안 함)` 으로 두면 해당 옵션을 붙이지 않아 claude 의 기본값·기존 설정을 그대로 쓴다. 이어서(`--resume`) 여는 세션에도 같은 값이 적용된다.
-- 마지막 실행값은 자동 저장·복원된다.
+- **셀 배치**: `셀 지정…` 을 누르면 행 수·열 수만큼 칸이 나오고, 칸마다 놓을 세션을 고른다. 예) `1행 2열` 에 A, `2행 3열` 에 B. 확인하면 행 수·열 수와 함께 실행 탭에 반영된다(요약이 `A→1행2열, B→2행3열` 로 보인다).
+  - 칸을 고르지 않은 세션은 **비어 있는 칸을 위→아래, 왼→오른 순서로** 채운다. 칸에 아무 세션도 없으면 그 자리는 비워 둔다.
+  - 한 세션은 한 칸에만 둘 수 있다(다른 칸에 또 고르면 앞의 칸은 `(자동)` 으로 돌아간다).
+  - 지정한 칸이 격자 밖이거나 칸이 모자라면 격자를 자동으로 키운다. 행 수·열 수가 `자동` 이면 세션 수에 맞춘다.
+  - 선택하지 않은 세션의 칸은 무시되고, 프로젝트를 바꾸면 칸 지정이 초기화된다. `한 창의 탭으로 열기` · `배치 안 함` 이면 적용되지 않는다.
+- 마지막 실행값은 자동 저장·복원된다(셀 지정 포함).
 - **세션 추가**: 세션 목록 끝의 `+ 추가` 를 누르고 개수를 고르면 다음 글자 폴더를 클론해 세션을 늘린다. 예) `web` 이 A~C 일 때 2개 → `web\web-d`, `-e` 를 클론하고 D·E 가 생긴다(새로 생긴 세션은 체크된 상태). 프로젝트에 원격 주소가 있어야 하며, Z(26개)까지 늘릴 수 있다.
 - **최근 실행 5개**: 클릭하면 옵션을 불러오고, 더블클릭하면 바로 실행한다.
 
@@ -91,6 +96,7 @@ D:\workspace\                    ← 작업 폴더(기본: 도구 폴더의 상�
 .\open-sessions.ps1 -Group my-app -TitlePrefix APP- # 세션 이름 APP-A ~ (기본은 MY-APP-A ~)
 .\open-sessions.ps1 -Group my-app -Monitor 1       # 두 번째 모니터에
 .\open-sessions.ps1 -Group my-app -Cols 2          # 2열 배치
+.\open-sessions.ps1 -Group my-app -Names a,b -Rows 2 -Cols 3 -Cells a:1:2,b:2:3   # A 는 1행 2열, B 는 2행 3열 칸에 배치(글자:행:열)
 .\open-sessions.ps1 -Group my-app -Tabs            # 한 창의 탭으로
 .\open-sessions.ps1 -Group my-app -NoLayout        # 창 위치·크기는 기본값 그대로
 .\open-sessions.ps1 -Group my-app -Bypass          # claude 에 --dangerously-skip-permissions
@@ -143,11 +149,11 @@ open-*.ps1 (터미널용 얇은 래퍼) ──────────▶  open-
 4. Windows Terminal(`wt`)로 연다. 기본은 창마다(`wt -w -1 new-tab …`), `-Tabs` 면 한 창에 탭(`;` 로 이음).
 5. (창 모드, `-NoLayout` 아니면) 뜬 창을 제목으로 찾아 칸에 맞춘다 → `window-layout.ps1`.
 
-주요 파라미터: `-Group` `-Prefix` `-TitlePrefix` `-Count` `-Names` `-Tabs` `-Bypass` `-Model` `-Effort` `-DryRun` `-NoLayout` `-Cols` `-Monitor` `-Root`.
-`-DryRun` 은 `[이어서]/[새로]` 와 `[배치] 제목 X= Y= 크기` 를 출력만 한다 — **고친 뒤 먼저 이걸로 확인한다.**
+주요 파라미터: `-Group` `-Prefix` `-TitlePrefix` `-Count` `-Names` `-Tabs` `-Bypass` `-Model` `-Effort` `-DryRun` `-NoLayout` `-Cols` `-Rows` `-Cells` `-Monitor` `-Root`.
+`-DryRun` 은 `[이어서]/[새로]` 와 `[배치] 제목 N행 M열 X= Y= 크기` 를 출력만 한다 — **고친 뒤 먼저 이걸로 확인한다.**
 
 ### `window-layout.ps1`
-- `Get-GridRects -Count n [-Cols c] [-Monitor m]`: 모니터 작업 영역(작업 표시줄 제외)을 칸으로 나눈다. 열 수 자동: 1→1, 2→2, 3→3, 4→2, 5·6→3, 7·8→4, 그 외 ⌈√n⌉.
+- `Get-GridRects -Count n [-Cols c] [-Rows r] [-Monitor m] [-Cells @{0=@{Row=1;Col=2}}]`: 모니터 작업 영역(작업 표시줄 제외)을 칸으로 나눈다. 열 수 자동: 1→1, 2→2, 3→3, 4→2, 5·6→3, 7·8→4, 그 외 ⌈√n⌉. `-Cells` 는 창 번호(0부터) → 칸(행·열 1부터)이며, 지정하지 않은 창은 빈 칸을 위→아래·왼→오른 순서로 채운다. 칸이 겹치면 뒤의 창은 자동으로 돌리고, 칸이 격자 밖이거나 모자라면 격자를 키운다. 화면 쪽 계산(`GridLayout.Resolve`)과 같은 규칙이다.
 - `Wait-NewTerminalWindow`: **방금 연 창**을 찾는다. 열기 전에 기억해 둔 핸들(`$before`)은 제외하고, 창 클래스 `CASCADIA_HOSTING_WINDOW_CLASS` + 제목이 같은 것만 본다(같은 이름의 기존 창과 헷갈리지 않게).
 - `Set-WindowRect`: Win32(`SetWindowPos`)로 맞춘다. Windows 10/11 창의 **보이지 않는 테두리**(보통 좌우·아래 7px 안팎)를 `DwmGetWindowAttribute(EXTENDED_FRAME_BOUNDS)` 로 재서 보정한다.
 - 모니터 번호: 0 = 주 모니터, 그 다음은 X 좌표 순. 번호가 없으면 경고하고 주 모니터를 쓴다.
@@ -179,7 +185,7 @@ recent=위와 같은 형식                          (최대 5줄, 새것이 위
 | 하고 싶은 것 | 고칠 곳 |
 |---|---|
 | 창 여는 방식·`claude` 인자 바꾸기 | `open-sessions.ps1` (`Get-TabArgs`, `$targets` 만드는 부분) |
-| 배치 규칙(열 수 자동 표, 여백) | `window-layout.ps1` 의 `Get-GridRects` |
+| 배치 규칙(열 수 자동 표, 여백, 셀 지정) | `window-layout.ps1` 의 `Get-GridRects` (+ C# 의 `GridLayout.Resolve` 를 같이) |
 | 화면 옵션 추가 | ① `RunOptions` 필드·`Serialize/Parse/Describe` ② `Launch.BuildArgs` ③ 화면 컨트롤 + `Collect/ApplyOptions` ④ `open-sessions.ps1` 파라미터 ⑤ `SelfTest` (래퍼를 쓴다면 그 `param` 도) |
 | 최근 실행 개수 | `Settings.MaxRecent` |
 | 세션 이름 규칙 | `ProjectDef.DefaultTitle`, 스크립트의 `$cfg.Title` |
